@@ -1,6 +1,7 @@
 import asyncio
 import signal
 import sys
+from datetime import datetime, timezone
 
 import aiohttp
 from telegram.ext import Application, CommandHandler
@@ -9,6 +10,7 @@ import db
 from config import (
     BUY_PERCENT,
     CHAIN,
+    EXPLORER_TX,
     MAX_MCAP,
     MIN_LIQUIDITY,
     MIN_MCAP,
@@ -139,6 +141,8 @@ async def cmd_help(update, context):
         lines.append("/balance — Wallet balance")
         lines.append("/history — Last 10 completed trades")
         lines.append("/config — Current bot configuration")
+        lines.append("/buy &lt;address&gt; [amount] — Manual buy")
+        lines.append("/sell &lt;address&gt; [percent] — Manual sell")
         if is_admin:
             lines.append("\n<b>Admin only:</b>")
             lines.append("/start — Start scanning and trading")
@@ -181,7 +185,8 @@ async def cmd_start(update, context):
         f"Wallet balance: {balance:.4f} {native}\n"
         f"Buy: {BUY_PERCENT}% | TP: {TAKE_PROFIT}% | Slippage: {SLIPPAGE}%\n"
         f"Scan every {SCAN_INTERVAL}s | Monitor every {MONITOR_INTERVAL}s\n"
-        f"MCap: ${MIN_MCAP:,}–${MAX_MCAP:,} | Min Liq: ${MIN_LIQUIDITY:,}"
+        f"MCap: ${MIN_MCAP:,}–${MAX_MCAP:,} | Min Liq: ${MIN_LIQUIDITY:,}\n"
+        f"Manual: /buy &lt;address&gt; [amount] | /sell &lt;address&gt; [percent]"
     )
     await update.message.reply_html(msg)
     logger.info("Bot started by user %s", update.effective_user.id)
@@ -292,6 +297,194 @@ async def cmd_config(update, context):
         f"Monitor Interval: {MONITOR_INTERVAL}s"
     )
     await update.message.reply_html(msg)
+
+
+async def cmd_buy(update, context):
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_html(
+            "Usage: <code>/buy &lt;token_address&gt; [amount]</code>\n"
+            "Example: <code>/buy So1abc...xyz 0.5</code>\n"
+            "If amount is omitted, uses configured BUY_PERCENT% of balance."
+        )
+        return
+
+    token_address = context.args[0].strip()
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    if len(context.args) >= 2:
+        try:
+            buy_amount = float(context.args[1])
+            if buy_amount <= 0:
+                await update.message.reply_text("Amount must be positive.")
+                return
+        except ValueError:
+            await update.message.reply_text("Invalid amount. Must be a number.")
+            return
+    else:
+        if CHAIN.upper() == "SOL":
+            buy_amount = await trader.get_buy_amount()
+        else:
+            buy_amount = await trader.get_buy_amount(CHAIN)
+
+    if buy_amount <= 0:
+        await update.message.reply_text(f"Insufficient {native} balance.")
+        return
+
+    already = await db.is_token_already_bought(token_address, CHAIN.upper())
+    if already:
+        await update.message.reply_text("Already holding a position in this token.")
+        return
+
+    await update.message.reply_html(
+        f"\U0001f504 <b>Manual Buy</b>\n"
+        f"Token: <code>{token_address}</code>\n"
+        f"Amount: {buy_amount:.4f} {native}\n"
+        f"Executing..."
+    )
+
+    if CHAIN.upper() == "SOL":
+        result = await trader.buy_token(token_address, buy_amount)
+    else:
+        result = await trader.buy_token(token_address, CHAIN, buy_amount)
+
+    if result is None:
+        await update.message.reply_html("\u274c <b>Buy failed.</b> Check logs for details.")
+        logger.error("Manual buy failed for %s", token_address)
+        return
+
+    symbol = token_address[:8]
+    position = {
+        "token_address": token_address,
+        "token_symbol": result.get("symbol", symbol),
+        "chain": CHAIN.upper(),
+        "entry_price": result["entry_price"],
+        "tokens_received": result["tokens_received"],
+        "buy_amount_native": result["amount_spent"],
+        "buy_tx_hash": result["tx_hash"],
+        "pair_address": "",
+    }
+    await db.save_open_position(position)
+
+    await notifier.notify_buy_executed(
+        symbol=symbol,
+        tokens_received=result["tokens_received"],
+        entry_price=result["entry_price"],
+        tx_hash=result["tx_hash"],
+        chain=CHAIN.upper(),
+    )
+
+    logger.info("Manual buy executed: %s, tx=%s", token_address, result["tx_hash"])
+
+
+async def cmd_sell(update, context):
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_html(
+            "Usage: <code>/sell &lt;token_address&gt; [percent]</code>\n"
+            "Example: <code>/sell So1abc...xyz 50</code> (sell 50%)\n"
+            "If percent is omitted, sells 100% of holdings."
+        )
+        return
+
+    token_address = context.args[0].strip()
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    sell_percent = 100
+    if len(context.args) >= 2:
+        try:
+            sell_percent = float(context.args[1])
+            if sell_percent <= 0 or sell_percent > 100:
+                await update.message.reply_text("Percent must be between 1 and 100.")
+                return
+        except ValueError:
+            await update.message.reply_text("Invalid percent. Must be a number.")
+            return
+
+    if CHAIN.upper() == "SOL":
+        ui_balance, decimals = await trader.get_token_balance(token_address)
+    else:
+        ui_balance, decimals = await trader.get_token_balance(token_address, CHAIN)
+
+    if ui_balance <= 0:
+        await update.message.reply_text("No tokens to sell \u2014 zero balance.")
+        return
+
+    sell_ui = ui_balance * (sell_percent / 100)
+    if decimals > 0:
+        sell_raw = int(sell_ui * (10 ** decimals))
+    else:
+        sell_raw = int(sell_ui * 1e9)
+
+    if sell_raw <= 0:
+        await update.message.reply_text("Amount too small to sell.")
+        return
+
+    await update.message.reply_html(
+        f"\U0001f504 <b>Manual Sell</b>\n"
+        f"Token: <code>{token_address}</code>\n"
+        f"Selling: {sell_percent}% ({sell_ui:.4f} tokens)\n"
+        f"Executing..."
+    )
+
+    if CHAIN.upper() == "SOL":
+        result = await trader.sell_token(token_address, sell_raw, decimals)
+    else:
+        result = await trader.sell_token(token_address, CHAIN, sell_raw, decimals)
+
+    if result is None:
+        await update.message.reply_html("\u274c <b>Sell failed.</b> Check logs for details.")
+        logger.error("Manual sell failed for %s", token_address)
+        return
+
+    if sell_percent == 100:
+        positions = await db.get_open_positions()
+        for pos in positions:
+            if pos["token_address"].lower() == token_address.lower() and pos["chain"] == CHAIN.upper():
+                entry_price = pos["entry_price"]
+                roi = ((result["exit_price"] - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+
+                opened_at = pos.get("opened_at", "")
+                duration_seconds = 0
+                if opened_at:
+                    try:
+                        if isinstance(opened_at, str):
+                            ot = datetime.fromisoformat(opened_at).replace(tzinfo=timezone.utc)
+                        else:
+                            ot = opened_at
+                        duration_seconds = int((datetime.now(timezone.utc) - ot).total_seconds())
+                    except Exception:
+                        pass
+
+                exit_data = {
+                    "exit_price": result["exit_price"],
+                    "sell_amount_native": result["native_received"],
+                    "profit_usd": None,
+                    "roi_percent": roi,
+                    "sell_tx_hash": result["tx_hash"],
+                    "duration_seconds": duration_seconds,
+                }
+                await db.close_position(token_address, CHAIN.upper(), exit_data)
+                break
+
+    tx_url = EXPLORER_TX.get(CHAIN.upper(), EXPLORER_TX["SOL"]).format(result["tx_hash"])
+    short_hash = result["tx_hash"][:10] + "\u2026" + result["tx_hash"][-6:] if len(result["tx_hash"]) > 20 else result["tx_hash"]
+
+    await update.message.reply_html(
+        f"\u2705 <b>Sell Executed</b>\n"
+        f"Token: <code>{token_address[:16]}...</code>\n"
+        f"Sold: {sell_percent}% ({sell_ui:.4f} tokens)\n"
+        f"Received: {result['native_received']:.6f} {native}\n"
+        f'TX: <a href="{tx_url}">{short_hash}</a>'
+    )
+
+    logger.info("Manual sell executed: %s (%d%%), tx=%s", token_address, sell_percent, result["tx_hash"])
 
 
 async def cmd_adduser(update, context):
@@ -405,6 +598,8 @@ def main():
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("config", cmd_config))
+    app.add_handler(CommandHandler("buy", cmd_buy))
+    app.add_handler(CommandHandler("sell", cmd_sell))
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
     app.add_handler(CommandHandler("users", cmd_users))
