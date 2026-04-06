@@ -1,0 +1,163 @@
+from telegram import Bot
+from telegram.constants import ParseMode
+
+from config import EXPLORER_TX, logger
+
+_MAX_MSG_LEN = 4096
+
+
+class Notifier:
+    def __init__(self, bot_token: str, chat_id: int):
+        self.bot = Bot(token=bot_token)
+        self.chat_id = chat_id
+
+    async def send_message(self, text: str):
+        try:
+            chunks = _split_message(text)
+            for chunk in chunks:
+                await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=chunk,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+        except Exception as exc:
+            logger.error("Failed to send Telegram message: %s", exc)
+
+    async def notify_new_token(self, token: dict, buy_amount: float, native_symbol: str):
+        mcap = _fmt_usd(token.get("market_cap", 0))
+        liquidity = _fmt_usd(token.get("liquidity", 0))
+        price = _fmt_price(token.get("price_usd", 0))
+        volume = _fmt_usd(token.get("volume_24h", 0))
+
+        msg = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔍 <b>NEW LOWCAP DETECTED</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🪙 Name: {_esc(token.get('name', '?'))} ({_esc(token.get('symbol', '?'))})\n"
+            f"📄 Contract: <code>{_esc(token.get('contract_address', ''))}</code>\n"
+            f"⛓ Chain: {_esc(token.get('chain', ''))}\n"
+            f"💰 Market Cap: {mcap}\n"
+            f"💧 Liquidity: {liquidity}\n"
+            f"📈 Price: {price}\n"
+            f"📊 24h Volume: {volume}\n"
+            f"👥 Holders: {_fmt_int(token.get('holders', 0))}\n"
+            f"🧾 Buy Tax: {token.get('buy_tax', 0):.1f}% | Sell Tax: {token.get('sell_tax', 0):.1f}%\n"
+            f"🔗 DexTools: {_esc(token.get('dextools_url', ''))}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚙️ Action: Buying with {buy_amount:.4f} {native_symbol}"
+        )
+        await self.send_message(msg)
+
+    async def notify_buy_executed(
+        self, symbol: str, tokens_received: float, entry_price: float, tx_hash: str, chain: str
+    ):
+        link = _tx_link(tx_hash, chain)
+        msg = (
+            "✅ <b>BUY EXECUTED</b>\n"
+            f"Token: {_esc(symbol)} | Amount: {_fmt_tokens(tokens_received)}\n"
+            f"Entry Price: {_fmt_price(entry_price)}\n"
+            f"TX: {link}"
+        )
+        await self.send_message(msg)
+
+    async def notify_take_profit(
+        self,
+        symbol: str,
+        entry_price: float,
+        exit_price: float,
+        roi: float,
+        profit_usd: float,
+        duration: str,
+        tx_hash: str,
+        chain: str,
+    ):
+        link = _tx_link(tx_hash, chain)
+        msg = (
+            f"💸 <b>PROFIT TAKEN — +{roi:.2f}%</b>\n"
+            f"Token: {_esc(symbol)}\n"
+            f"Entry: {_fmt_price(entry_price)} → Exit: {_fmt_price(exit_price)}\n"
+            f"Profit: +{_fmt_price(profit_usd)}\n"
+            f"Duration: {duration}\n"
+            f"TX: {link}"
+        )
+        await self.send_message(msg)
+
+    async def notify_error(self, error_msg: str):
+        msg = f"⚠️ <b>ERROR</b>\n<code>{_esc(error_msg)}</code>"
+        await self.send_message(msg)
+
+
+def _esc(text) -> str:
+    if text is None:
+        return ""
+    s = str(text)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _tx_link(tx_hash: str, chain: str) -> str:
+    base = EXPLORER_TX.get(chain.upper(), EXPLORER_TX["SOL"])
+    url = base.format(tx_hash)
+    short = tx_hash[:10] + "…" + tx_hash[-6:] if len(tx_hash) > 20 else tx_hash
+    return f'<a href="{url}">{short}</a>'
+
+
+def _fmt_usd(val) -> str:
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return "$0"
+    if v >= 1_000_000:
+        return f"${v:,.0f}"
+    if v >= 1_000:
+        return f"${v:,.0f}"
+    return f"${v:,.2f}"
+
+
+def _fmt_price(val) -> str:
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return "$0"
+    if v == 0:
+        return "$0"
+    if v >= 1:
+        return f"${v:,.4f}"
+    if v >= 0.0001:
+        return f"${v:.6f}"
+    return f"${v:.10f}"
+
+
+def _fmt_int(val) -> str:
+    try:
+        return f"{int(val):,}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _fmt_tokens(val) -> str:
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return "0"
+    if v >= 1_000_000:
+        return f"{v:,.2f}"
+    if v >= 1:
+        return f"{v:,.4f}"
+    return f"{v:.8f}"
+
+
+def _split_message(text: str) -> list[str]:
+    if len(text) <= _MAX_MSG_LEN:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= _MAX_MSG_LEN:
+            chunks.append(text)
+            break
+        split_at = text.rfind("\n", 0, _MAX_MSG_LEN)
+        if split_at == -1:
+            split_at = _MAX_MSG_LEN
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
