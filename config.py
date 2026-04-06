@@ -52,6 +52,12 @@ CHAIN_MAP = {
     "BSC": "bsc",
 }
 
+DS_CHAIN_MAP = {
+    "SOL": "solana",
+    "ETH": "ethereum",
+    "BSC": "bsc",
+}
+
 NATIVE_SYMBOL = {
     "SOL": "SOL",
     "ETH": "ETH",

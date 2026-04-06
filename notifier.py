@@ -29,6 +29,12 @@ class Notifier:
         liquidity = _fmt_usd(token.get("liquidity", 0))
         price = _fmt_price(token.get("price_usd", 0))
         volume = _fmt_usd(token.get("volume_24h", 0))
+        source = token.get("source", "dextools")
+
+        if source == "dexscreener":
+            holders_str = "N/A"
+        else:
+            holders_str = _fmt_int(token.get("holders", 0))
 
         msg = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -41,9 +47,11 @@ class Notifier:
             f"💧 Liquidity: {liquidity}\n"
             f"📈 Price: {price}\n"
             f"📊 24h Volume: {volume}\n"
-            f"👥 Holders: {_fmt_int(token.get('holders', 0))}\n"
+            f"👥 Holders: {holders_str}\n"
             f"🧾 Buy Tax: {token.get('buy_tax', 0):.1f}% | Sell Tax: {token.get('sell_tax', 0):.1f}%\n"
             f"🔗 DexTools: {_esc(token.get('dextools_url', ''))}\n"
+            f"🔗 DexScreener: {_esc(token.get('dex_pair_url', ''))}\n"
+            f"📡 Source: {_esc(source)}\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⚙️ Action: Buying with {buy_amount:.4f} {native_symbol}"
         )

@@ -336,3 +336,49 @@ async def scan_for_new_tokens(session: aiohttp.ClientSession, chain: str | None 
 
     logger.info("Scan complete – %d qualifying tokens found", len(qualifying))
     return qualifying
+
+
+from dexscreener import scan_dexscreener
+
+
+async def scan_all_sources(session: aiohttp.ClientSession, chain: str | None = None) -> list[dict]:
+    """
+    Scan both DexTools and DexScreener, merge and deduplicate results.
+    DexTools is primary; DexScreener is fallback/supplement.
+    """
+    chain = (chain or CHAIN).upper()
+
+    dextools_results, dexscreener_results = await asyncio.gather(
+        scan_for_new_tokens(session, chain),
+        scan_dexscreener(session, chain),
+        return_exceptions=True,
+    )
+
+    if isinstance(dextools_results, Exception):
+        logger.error("DexTools scanner failed: %s", dextools_results)
+        dextools_results = []
+    if isinstance(dexscreener_results, Exception):
+        logger.error("DexScreener scanner failed: %s", dexscreener_results)
+        dexscreener_results = []
+
+    seen_addresses: set[str] = set()
+    merged: list[dict] = []
+
+    for token in dextools_results:
+        addr = token.get("contract_address", "").lower()
+        if addr and addr not in seen_addresses:
+            seen_addresses.add(addr)
+            token["source"] = token.get("source", "dextools")
+            merged.append(token)
+
+    for token in dexscreener_results:
+        addr = token.get("contract_address", "").lower()
+        if addr and addr not in seen_addresses:
+            seen_addresses.add(addr)
+            merged.append(token)
+
+    logger.info(
+        "Combined scan: %d from DexTools + %d from DexScreener = %d merged (%d unique)",
+        len(dextools_results), len(dexscreener_results), len(merged), len(seen_addresses),
+    )
+    return merged

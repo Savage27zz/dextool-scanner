@@ -23,7 +23,7 @@ from config import (
 )
 from monitor import ProfitMonitor, _format_duration
 from notifier import Notifier
-from scanner import scan_for_new_tokens
+from scanner import scan_all_sources
 from trader import create_trader
 
 trader = None
@@ -67,7 +67,7 @@ async def scanner_loop():
     while is_running:
         try:
             async with aiohttp.ClientSession() as session:
-                tokens = await scan_for_new_tokens(session, CHAIN)
+                tokens = await scan_all_sources(session, CHAIN)
 
                 for token in tokens:
                     try:
