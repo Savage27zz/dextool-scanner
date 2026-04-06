@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS fee_ledger (
     fee_amount_native REAL NOT NULL,
     fee_percent REAL NOT NULL,
     fee_tx_hash TEXT,
-    status TEXT DEFAULT 'pending',
+    status TEXT DEFAULT 'pending',   -- 'pending', 'submitted', 'collected', 'failed'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -637,7 +637,7 @@ async def get_fee_stats() -> dict:
         cursor = await db.execute(
             "SELECT "
             "  COALESCE(SUM(CASE WHEN status='collected' THEN fee_amount_native ELSE 0 END), 0) AS total_collected, "
-            "  COALESCE(SUM(CASE WHEN status='pending' THEN fee_amount_native ELSE 0 END), 0) AS total_pending, "
+            "  COALESCE(SUM(CASE WHEN status='pending' OR status='submitted' THEN fee_amount_native ELSE 0 END), 0) AS total_pending, "
             "  COALESCE(SUM(CASE WHEN status='failed' THEN fee_amount_native ELSE 0 END), 0) AS total_failed, "
             "  COUNT(*) AS count "
             "FROM fee_ledger"

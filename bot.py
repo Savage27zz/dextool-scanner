@@ -838,25 +838,28 @@ async def cmd_sell(update, context):
                 }
                 await db.close_position(pos["token_address"], CHAIN.upper(), exit_data, user_id=user_id)
 
-                profit_native = result["native_received"] - pos["buy_amount_native"]
-                if profit_native > 0:
-                    admin_wallet_data = await db.get_user_wallet(TELEGRAM_CHAT_ID)
-                    if admin_wallet_data:
-                        fee_result = await collect_fee(
-                            user_id=user_id,
-                            token_symbol=pos["token_symbol"],
-                            profit_native=profit_native,
-                            admin_public_key=admin_wallet_data["public_key"],
-                        )
-                        if fee_result and fee_result.get("tx_hash"):
-                            await update.message.reply_html(
-                                f"💰 Operator fee: {fee_result['fee_amount']:.6f} SOL "
-                                f"({fee_result['fee_pct']:.1f}% of profit)"
+                try:
+                    profit_native = result["native_received"] - pos["buy_amount_native"]
+                    if profit_native > 0:
+                        admin_wallet_data = await db.get_user_wallet(TELEGRAM_CHAT_ID)
+                        if admin_wallet_data:
+                            fee_result = await collect_fee(
+                                user_id=user_id,
+                                token_symbol=pos["token_symbol"],
+                                profit_native=profit_native,
+                                admin_public_key=admin_wallet_data["public_key"],
                             )
-                            await notifier.send_message(
-                                f"💰 Fee collected: {fee_result['fee_amount']:.6f} SOL from user {user_id} "
-                                f"({fee_result['fee_pct']:.1f}% of {profit_native:.6f} SOL profit on {pos['token_symbol']})"
-                            )
+                            if fee_result and fee_result.get("tx_hash"):
+                                await update.message.reply_html(
+                                    f"💰 Operator fee: {fee_result['fee_amount']:.6f} SOL "
+                                    f"({fee_result['fee_pct']:.1f}% of profit)"
+                                )
+                                await notifier.send_message(
+                                    f"💰 Fee collected: {fee_result['fee_amount']:.6f} SOL from user {user_id} "
+                                    f"({fee_result['fee_pct']:.1f}% of {profit_native:.6f} SOL profit on {pos['token_symbol']})"
+                                )
+                except Exception as fee_exc:
+                    logger.error("Fee collection failed during manual sell: %s", fee_exc)
 
                 break
 

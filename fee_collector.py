@@ -1,5 +1,8 @@
 import asyncio
+import time
+
 from solders.pubkey import Pubkey
+from solders.signature import Signature
 from solders.system_program import TransferParams, transfer
 from solders.transaction import Transaction
 from solders.message import Message
@@ -72,7 +75,38 @@ async def collect_fee(
         )
         sig = str(resp.value)
 
-        await db.update_fee_status(fee_id, "collected", sig)
+        try:
+            fee_sig = Signature.from_string(sig)
+            start = time.time()
+            confirmed = False
+            while time.time() - start < 15:
+                status_resp = await client.get_signature_statuses([fee_sig])
+                statuses = status_resp.value
+                if statuses and statuses[0] is not None:
+                    if statuses[0].err is None:
+                        confirmed = True
+                        break
+                    else:
+                        logger.warning("Fee tx failed on-chain: %s", sig)
+                        await db.update_fee_status(fee_id, "failed", sig)
+                        return {
+                            "fee_id": fee_id,
+                            "fee_amount": fee_amount,
+                            "fee_pct": OPERATOR_FEE_PCT,
+                            "tx_hash": sig,
+                            "error": "tx failed on-chain",
+                        }
+                await asyncio.sleep(2)
+
+            if confirmed:
+                await db.update_fee_status(fee_id, "collected", sig)
+            else:
+                await db.update_fee_status(fee_id, "submitted", sig)
+                logger.warning("Fee tx submitted but unconfirmed after 15s: %s", sig)
+        except Exception as confirm_exc:
+            logger.warning("Fee confirmation check failed: %s", confirm_exc)
+            await db.update_fee_status(fee_id, "submitted", sig)
+
         logger.info(
             "Fee collected: %.6f SOL from user %d for %s trade (%.1f%% of %.6f profit), tx=%s",
             fee_amount, user_id, token_symbol, OPERATOR_FEE_PCT, profit_native, sig,
