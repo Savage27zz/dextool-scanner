@@ -54,13 +54,33 @@ class ProfitMonitor:
                 roi = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                 logger.debug("%s ROI: %.2f%% (entry=%.10f, current=%.10f)", symbol, roi, entry_price, current_price)
 
+                peak_price = pos.get("peak_price", 0) or entry_price
+                if current_price > peak_price:
+                    peak_price = current_price
+                    await db.update_peak_price(token_address, chain, peak_price)
+
                 trigger = None
-                if roi >= TAKE_PROFIT:
-                    trigger = "tp"
-                    logger.info("TP target hit for %s – ROI %.2f%% >= %d%%", symbol, roi, TAKE_PROFIT)
-                elif roi <= STOP_LOSS:
+                drop_from_peak = 0.0
+
+                if roi <= STOP_LOSS:
                     trigger = "sl"
                     logger.info("SL target hit for %s – ROI %.2f%% <= %d%%", symbol, roi, STOP_LOSS)
+                elif TRAILING_STOP > 0 and roi >= TAKE_PROFIT:
+                    drop_from_peak = ((peak_price - current_price) / peak_price) * 100 if peak_price > 0 else 0
+                    if drop_from_peak >= TRAILING_STOP:
+                        trigger = "ts"
+                        logger.info(
+                            "Trailing stop for %s – dropped %.2f%% from peak (threshold %d%%)",
+                            symbol, drop_from_peak, TRAILING_STOP,
+                        )
+                    else:
+                        logger.debug(
+                            "%s above TP but trailing: peak=%.10f, drop=%.2f%% < %d%%",
+                            symbol, peak_price, drop_from_peak, TRAILING_STOP,
+                        )
+                elif roi >= TAKE_PROFIT:
+                    trigger = "tp"
+                    logger.info("TP target hit for %s – ROI %.2f%% >= %d%%", symbol, roi, TAKE_PROFIT)
 
                 if trigger:
                     if chain.upper() == "SOL":
@@ -117,6 +137,19 @@ class ProfitMonitor:
                             exit_price=sell_result["exit_price"],
                             roi=round(roi, 2),
                             profit_usd=pnl_native,
+                            duration=duration_str,
+                            tx_hash=sell_result["tx_hash"],
+                            chain=chain,
+                        )
+                    elif trigger == "ts":
+                        await self.notifier.notify_trailing_stop(
+                            symbol=symbol,
+                            entry_price=entry_price,
+                            peak_price=peak_price,
+                            exit_price=sell_result["exit_price"],
+                            roi=round(roi, 2),
+                            drop_pct=round(drop_from_peak, 2),
+                            pnl_native=pnl_native,
                             duration=duration_str,
                             tx_hash=sell_result["tx_hash"],
                             chain=chain,

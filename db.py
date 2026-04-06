@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS open_positions (
     buy_amount_native REAL NOT NULL,
     buy_tx_hash TEXT NOT NULL,
     pair_address TEXT,
+    peak_price REAL DEFAULT 0,
     opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(token_address, chain)
 );
@@ -94,6 +95,11 @@ async def init_db():
         await db.execute(_CREATE_COMPLETED_TRADES)
         await db.execute(_CREATE_ALLOWED_USERS)
         await db.commit()
+        try:
+            await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
+            await db.commit()
+        except Exception:
+            pass
     logger.info("Database initialised at %s", DB_PATH)
 
 
@@ -137,8 +143,8 @@ async def save_open_position(position: dict):
     sql = """
         INSERT INTO open_positions
             (token_address, token_symbol, chain, entry_price, tokens_received,
-             buy_amount_native, buy_tx_hash, pair_address)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             buy_amount_native, buy_tx_hash, pair_address, peak_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         position["token_address"],
@@ -149,6 +155,7 @@ async def save_open_position(position: dict):
         position["buy_amount_native"],
         position["buy_tx_hash"],
         position.get("pair_address"),
+        position["entry_price"],
     )
     async with aiosqlite.connect(str(DB_PATH)) as db:
         await db.execute(sql, params)
@@ -261,6 +268,15 @@ async def is_user_allowed(user_id: int) -> bool:
             "SELECT 1 FROM allowed_users WHERE user_id = ? LIMIT 1", (user_id,)
         )
         return await cursor.fetchone() is not None
+
+
+async def update_peak_price(token_address: str, chain: str, peak_price: float):
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute(
+            "UPDATE open_positions SET peak_price = ? WHERE token_address = ? AND chain = ?",
+            (peak_price, token_address, chain),
+        )
+        await conn.commit()
 
 
 async def is_token_already_bought(contract_address: str, chain: str) -> bool:

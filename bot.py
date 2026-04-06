@@ -22,6 +22,7 @@ from config import (
     SLIPPAGE,
     STOP_LOSS,
     TAKE_PROFIT,
+    TRAILING_STOP,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     logger,
@@ -197,6 +198,7 @@ async def cmd_start(update, context):
         f"Chain: {CHAIN}\n"
         f"Wallet balance: {balance:.4f} {native}\n"
         f"Buy: {BUY_PERCENT}% | TP: {TAKE_PROFIT}% | SL: {STOP_LOSS}% | Slippage: {SLIPPAGE}%\n"
+        f"Trailing Stop: {TRAILING_STOP}%{'  (disabled)' if TRAILING_STOP == 0 else ''}\n"
         f"Max Positions: {MAX_POSITIONS}\n"
         f"Scan every {SCAN_INTERVAL}s | Monitor every {MONITOR_INTERVAL}s\n"
         f"MCap: ${MIN_MCAP:,}–${MAX_MCAP:,} | Min Liq: ${MIN_LIQUIDITY:,}\n"
@@ -305,6 +307,7 @@ async def cmd_config(update, context):
         f"Buy Percent: {BUY_PERCENT}%\n"
         f"Take Profit: {TAKE_PROFIT}%\n"
         f"Stop Loss: {STOP_LOSS}%\n"
+        f"Trailing Stop: {TRAILING_STOP}%{'  (disabled)' if TRAILING_STOP == 0 else ''}\n"
         f"Slippage: {SLIPPAGE}%\n"
         f"Min Liquidity: ${MIN_LIQUIDITY:,}\n"
         f"Market Cap Range: ${MIN_MCAP:,} – ${MAX_MCAP:,}\n"

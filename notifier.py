@@ -101,6 +101,33 @@ class Notifier:
         )
         await self.send_message(msg)
 
+    async def notify_trailing_stop(
+        self,
+        symbol: str,
+        entry_price: float,
+        peak_price: float,
+        exit_price: float,
+        roi: float,
+        drop_pct: float,
+        pnl_native: float,
+        duration: str,
+        tx_hash: str,
+        chain: str,
+    ):
+        link = _tx_link(tx_hash, chain)
+        native = {"SOL": "SOL", "ETH": "ETH", "BSC": "BNB"}.get(chain.upper(), "SOL")
+        pnl_sign = "+" if pnl_native >= 0 else ""
+        msg = (
+            f"\U0001f514 <b>TRAILING STOP \u2014 {roi:+.2f}%</b>\n"
+            f"Token: {_esc(symbol)}\n"
+            f"Entry: {_fmt_price(entry_price)} \u2192 Exit: {_fmt_price(exit_price)}\n"
+            f"Peak: {_fmt_price(peak_price)} (dropped {drop_pct:.1f}%)\n"
+            f"PnL: {pnl_sign}{pnl_native:.6f} {native}\n"
+            f"Duration: {duration}\n"
+            f"TX: {link}"
+        )
+        await self.send_message(msg)
+
     async def notify_stop_loss(
         self,
         symbol: str,
