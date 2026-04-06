@@ -16,6 +16,7 @@ Automated Telegram trading bot that scans DexTools for newly launched low-cap to
 - **Rotating log files** — `trading.log` with automatic rotation (5 MB × 3 backups)
 - **Graceful shutdown** — handles SIGINT/SIGTERM cleanly
 - **Whale tracking** — monitors configurable whale wallets for large buys on watched tokens (Solana only)
+- **Anti-rug protection** — monitors liquidity of open positions; auto-sells immediately if liquidity drops below a floor or by a configurable percentage from entry
 
 ## Prerequisites
 
@@ -67,6 +68,9 @@ Edit `.env` with your values:
 | `WHALE_TRACKING_ENABLED` | Enable whale/smart-money wallet tracking (Solana only) | `true` |
 | `WHALE_CHECK_INTERVAL` | Seconds between whale wallet checks | `45` |
 | `WHALE_MIN_SOL` | Minimum SOL spent by whale to trigger alert | `1.0` |
+| `ANTIRUG_ENABLED` | Enable anti-rug liquidity protection | `true` |
+| `ANTIRUG_MIN_LIQ` | Emergency sell if liquidity drops below this USD amount | `1000` |
+| `ANTIRUG_LIQ_DROP_PCT` | Emergency sell if liquidity drops by this % from entry | `70` |
 
 ## Usage
 
@@ -150,7 +154,8 @@ config.py ─── loaded by all modules (env vars + logger)
 2. Filters by market cap, liquidity, age, and honeypot status
 3. `trader.py` executes a buy (Jupiter swap on Solana, or Uniswap/PancakeSwap on EVM)
 4. `monitor.py` checks positions every 30s using Jupiter Price API (or on-chain quotes for EVM)
-5. When ROI hits the take-profit target, executes a sell and logs the trade
+5. Anti-rug check runs first each cycle — if liquidity drops below the floor or by the configured %, triggers an emergency sell
+6. When ROI hits the take-profit target, executes a sell and logs the trade
 
 ## File Overview
 

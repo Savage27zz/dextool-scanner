@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 import aiohttp
 
 import db
-from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, STOP_LOSS, TAKE_PROFIT, TRAILING_DROP, TRAILING_ENABLED, logger
+from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, STOP_LOSS, TAKE_PROFIT, TRAILING_DROP, TRAILING_ENABLED, ANTIRUG_ENABLED, ANTIRUG_MIN_LIQ, ANTIRUG_LIQ_DROP_PCT, logger
+from dexscreener import get_token_liquidity
 
 
 class ProfitMonitor:
@@ -15,7 +16,10 @@ class ProfitMonitor:
 
     async def start(self):
         self.running = True
-        logger.info("ProfitMonitor started (interval=%ds, TP=%d%%, SL=%d%%)", MONITOR_INTERVAL, TAKE_PROFIT, STOP_LOSS)
+        logger.info(
+            "ProfitMonitor started (interval=%ds, TP=%d%%, SL=%d%%, anti-rug=%s)",
+            MONITOR_INTERVAL, TAKE_PROFIT, STOP_LOSS, "ON" if ANTIRUG_ENABLED else "OFF",
+        )
         while self.running:
             try:
                 await self.check_positions()
@@ -96,6 +100,55 @@ class ProfitMonitor:
             symbol = pos["token_symbol"]
 
             try:
+                # ── Anti-rug check (runs first, before price/TP/SL) ──
+                if ANTIRUG_ENABLED:
+                    rug_detected = False
+                    rug_reason = ""
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            current_liq = await get_token_liquidity(session, chain, token_address)
+
+                        entry_liq = pos.get("entry_liquidity", 0) or 0
+
+                        if current_liq > 0 and current_liq < ANTIRUG_MIN_LIQ:
+                            rug_detected = True
+                            rug_reason = f"Liquidity ${current_liq:,.0f} below ${ANTIRUG_MIN_LIQ:,} floor"
+                        elif entry_liq > 0 and current_liq > 0:
+                            drop_pct = ((entry_liq - current_liq) / entry_liq) * 100
+                            if drop_pct >= ANTIRUG_LIQ_DROP_PCT:
+                                rug_detected = True
+                                rug_reason = f"Liquidity dropped {drop_pct:.0f}% (${entry_liq:,.0f} → ${current_liq:,.0f})"
+
+                    except Exception as exc:
+                        logger.error("Anti-rug check failed for %s: %s", symbol, exc)
+
+                    if rug_detected:
+                        logger.warning("RUG DETECTED for %s: %s", symbol, rug_reason)
+                        try:
+                            current_price = await self._get_current_price(token_address, chain)
+                            roi = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                        except Exception:
+                            roi = -100
+
+                        sell_result = await self._execute_sell_and_close(pos, roi, "Anti-rug")
+                        if sell_result:
+                            native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
+                            duration_str = _format_duration(sell_result["duration_seconds"])
+                            loss_native = sell_result["native_received"] - pos["buy_amount_native"]
+                            await self.notifier.notify_rug_pull(
+                                symbol=symbol,
+                                entry_price=entry_price,
+                                exit_price=sell_result["exit_price"],
+                                roi=round(roi, 2),
+                                loss_native=loss_native,
+                                duration=duration_str,
+                                tx_hash=sell_result["tx_hash"],
+                                chain=chain,
+                                reason=rug_reason,
+                            )
+                        continue
+
+                # ── Price / TP / SL logic ──
                 current_price = await self._get_current_price(token_address, chain)
                 if current_price <= 0:
                     logger.debug("Could not get price for %s", symbol)

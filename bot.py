@@ -25,6 +25,9 @@ from config import (
     TELEGRAM_CHAT_ID,
     TRAILING_DROP,
     TRAILING_ENABLED,
+    ANTIRUG_ENABLED,
+    ANTIRUG_MIN_LIQ,
+    ANTIRUG_LIQ_DROP_PCT,
     logger,
 )
 from monitor import ProfitMonitor, _format_duration
@@ -114,6 +117,7 @@ async def scanner_loop():
                             "buy_amount_native": result["amount_spent"],
                             "buy_tx_hash": result["tx_hash"],
                             "pair_address": token.get("pair_address", ""),
+                            "entry_liquidity": token.get("liquidity", 0),
                         }
                         await db.save_open_position(position)
 
@@ -323,7 +327,10 @@ async def cmd_config(update, context):
         f"Monitor Interval: {MONITOR_INTERVAL}s\n"
         f"Whale Tracking: {'Enabled' if WHALE_TRACKING_ENABLED else 'Disabled'}\n"
         f"Whale Check Interval: {WHALE_CHECK_INTERVAL}s\n"
-        f"Whale Min SOL: {WHALE_MIN_SOL} SOL"
+        f"Whale Min SOL: {WHALE_MIN_SOL} SOL\n"
+        f"Anti-Rug: {'Enabled' if ANTIRUG_ENABLED else 'Disabled'}\n"
+        f"Anti-Rug Min Liquidity: ${ANTIRUG_MIN_LIQ:,}\n"
+        f"Anti-Rug Drop Threshold: {ANTIRUG_LIQ_DROP_PCT}%"
     )
     await update.message.reply_html(msg)
 
@@ -398,6 +405,15 @@ async def cmd_buy(update, context):
         return
 
     symbol = token_address[:8]
+
+    entry_liq = 0.0
+    try:
+        from dexscreener import get_token_liquidity
+        async with aiohttp.ClientSession() as liq_session:
+            entry_liq = await get_token_liquidity(liq_session, CHAIN, token_address)
+    except Exception:
+        pass
+
     position = {
         "token_address": token_address,
         "token_symbol": result.get("symbol", symbol),
@@ -407,6 +423,7 @@ async def cmd_buy(update, context):
         "buy_amount_native": result["amount_spent"],
         "buy_tx_hash": result["tx_hash"],
         "pair_address": "",
+        "entry_liquidity": entry_liq,
     }
     await db.save_open_position(position)
 
