@@ -1069,24 +1069,37 @@ async def cmd_removeuser(update, context):
         await update.message.reply_text("Invalid user ID. Must be a number.")
         return
 
-    warn_parts = []
-    open_positions = await db.get_open_positions(user_id=user_id)
-    if open_positions:
-        warn_parts.append(f"{len(open_positions)} open position(s)")
+    force = len(context.args) > 1 and context.args[1].lower() == "force"
 
+    open_positions = await db.get_open_positions(user_id=user_id)
     ut = await create_user_trader(user_id)
-    if ut:
-        bal = await ut.get_balance()
-        if bal > 0.001:
-            warn_parts.append(f"{bal:.4f} SOL balance")
+    balance = await ut.get_balance() if ut else 0.0
+
+    if (open_positions or balance > 0.001) and not force:
+        warn_parts = []
+        if open_positions:
+            warn_parts.append(f"{len(open_positions)} open position(s)")
+        if balance > 0.001:
+            warn_parts.append(f"{balance:.4f} SOL balance")
+        await update.message.reply_html(
+            f"⚠️ User <code>{user_id}</code> has {' and '.join(warn_parts)}.\n"
+            f"Funds will be <b>PERMANENTLY</b> lost.\n"
+            f"To confirm: <code>/removeuser {user_id} force</code>"
+        )
+        return
 
     removed = await db.remove_allowed_user(user_id)
     await db.delete_user_wallet(user_id)
 
     if removed:
         msg = f"🚫 User <code>{user_id}</code> access revoked."
+        warn_parts = []
+        if open_positions:
+            warn_parts.append(f"{len(open_positions)} open position(s)")
+        if balance > 0.001:
+            warn_parts.append(f"{balance:.4f} SOL balance")
         if warn_parts:
-            msg += f"\n⚠️ User had {' and '.join(warn_parts)}."
+            msg += f"\n⚠️ User had {' and '.join(warn_parts)} (now inaccessible)."
         await update.message.reply_html(msg)
     else:
         await update.message.reply_html(f"User <code>{user_id}</code> was not in the list.")

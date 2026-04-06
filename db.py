@@ -167,6 +167,36 @@ async def init_db():
             await db.execute("ALTER TABLE user_wallets ADD COLUMN encrypted_seed_phrase TEXT DEFAULT ''")
         except Exception:
             pass
+        try:
+            cursor = await db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='open_positions'"
+            )
+            row = await cursor.fetchone()
+            if row:
+                create_sql = row[0] or ""
+                if "user_id" not in create_sql:
+                    await db.execute("ALTER TABLE open_positions RENAME TO _open_positions_old")
+                    await db.execute(_CREATE_OPEN_POSITIONS)
+                    await db.execute("""
+                        INSERT INTO open_positions
+                            (id, token_address, token_symbol, chain, entry_price,
+                             tokens_received, buy_amount_native, buy_tx_hash,
+                             pair_address, peak_price, trailing_activated,
+                             entry_liquidity, user_id, opened_at)
+                        SELECT id, token_address, token_symbol, chain, entry_price,
+                               tokens_received, buy_amount_native, buy_tx_hash,
+                               pair_address,
+                               COALESCE(peak_price, 0),
+                               COALESCE(trailing_activated, 0),
+                               COALESCE(entry_liquidity, 0),
+                               0,
+                               opened_at
+                        FROM _open_positions_old
+                    """)
+                    await db.execute("DROP TABLE _open_positions_old")
+                    logger.info("Migrated open_positions table with user_id constraint")
+        except Exception as exc:
+            logger.warning("open_positions migration check: %s", exc)
         await db.commit()
     logger.info("Database initialised at %s", DB_PATH)
 
