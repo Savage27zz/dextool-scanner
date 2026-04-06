@@ -15,6 +15,7 @@ from config import (
     MIN_SCORE,
     logger,
 )
+from honeypot import check_honeypot
 from scorer import score_token
 
 _HEADERS = {
@@ -187,14 +188,18 @@ async def _enrich_token(session: aiohttp.ClientSession, chain_id: str, address: 
 
     if audit and isinstance(audit, dict):
         is_honeypot = audit.get("isHoneypot", False)
-        if is_honeypot:
-            logger.info("Skipping honeypot token %s (%s)", symbol, address)
-            return None
         buy_tax = _safe_float(audit.get("buyTax"))
         sell_tax = _safe_float(audit.get("sellTax"))
+        if is_honeypot or sell_tax > 50:
+            logger.info("Skipping honeypot token %s (%s) — sell_tax=%.1f%%", symbol, address, sell_tax)
+            return None
     else:
-        buy_tax = 0.0
-        sell_tax = 0.0
+        hp = await check_honeypot(session, chain, address)
+        if hp["is_honeypot"]:
+            logger.info("Skipping honeypot token %s (%s) — fallback check", symbol, address)
+            return None
+        buy_tax = hp["buy_tax"]
+        sell_tax = hp["sell_tax"]
 
     pair_address = ""
     liquidity = 0.0

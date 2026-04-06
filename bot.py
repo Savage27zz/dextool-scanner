@@ -26,6 +26,7 @@ from config import (
 )
 from monitor import ProfitMonitor, _format_duration
 from notifier import Notifier
+from honeypot import check_honeypot
 from scanner import scan_all_sources
 from trader import create_trader
 
@@ -340,6 +341,18 @@ async def cmd_buy(update, context):
     already = await db.is_token_already_bought(token_address, CHAIN.upper())
     if already:
         await update.message.reply_text("Already holding a position in this token.")
+        return
+
+    async with aiohttp.ClientSession() as hp_session:
+        hp = await check_honeypot(hp_session, CHAIN, token_address)
+    if hp["is_honeypot"]:
+        await update.message.reply_html(
+            "\U0001f6ab <b>Honeypot Detected</b>\n\n"
+            f"Token <code>{token_address}</code> flagged as honeypot.\n"
+            f"Buy Tax: {hp['buy_tax']:.1f}% | Sell Tax: {hp['sell_tax']:.1f}%\n"
+            "Buy cancelled for your safety."
+        )
+        logger.warning("Manual buy blocked — honeypot: %s", token_address)
         return
 
     await update.message.reply_html(

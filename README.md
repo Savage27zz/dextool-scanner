@@ -8,6 +8,7 @@ Automated Telegram trading bot that scans DexTools for newly launched low-cap to
 - **DexTools API v2 integration** — scans hot pools and new token listings
 - **Jupiter V6 swaps** — best-route execution on Solana via Jupiter aggregator
 - **Uniswap V2 / PancakeSwap V2** — DEX routing for EVM chains
+- **Honeypot protection** — dual-check via DexTools audit API + GoPlus Security blocks honeypot tokens before buying
 - **Configurable filters** — market cap range, minimum liquidity, honeypot detection
 - **Auto take-profit** — monitors positions and sells at target ROI
 - **Telegram interface** — real-time notifications and bot commands

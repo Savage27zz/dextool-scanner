@@ -12,6 +12,7 @@ from config import (
     MAX_MCAP,
     logger,
 )
+from honeypot import check_honeypot
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 
@@ -147,6 +148,14 @@ async def _enrich_from_dexscreener(
         logger.debug("DexScreener skip %s – already bought", symbol)
         return None
 
+    hp_result = await check_honeypot(session, chain, address)
+    if hp_result["is_honeypot"]:
+        logger.info(
+            "DexScreener skip %s – honeypot (buy=%.1f%% sell=%.1f%%)",
+            symbol, hp_result["buy_tax"], hp_result["sell_tax"],
+        )
+        return None
+
     info = best_pair.get("info") or {}
     social_links = {}
     for social in (info.get("socials") or []):
@@ -178,8 +187,8 @@ async def _enrich_from_dexscreener(
         "volume_24h": volume_24h,
         "price_change_24h": price_change_24h,
         "holders": 0,
-        "buy_tax": 0.0,
-        "sell_tax": 0.0,
+        "buy_tax": hp_result["buy_tax"] if hp_result["checked"] else 0.0,
+        "sell_tax": hp_result["sell_tax"] if hp_result["checked"] else 0.0,
         "dextools_url": dextools_url,
         "dex_pair_url": dexscreener_url,
         "deployer_wallet": "",
