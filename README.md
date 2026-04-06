@@ -23,6 +23,7 @@ Automated Telegram trading bot that scans DexTools for newly launched low-cap to
 - **Graceful shutdown** — handles SIGINT/SIGTERM cleanly
 - **Whale tracking** — monitors configurable whale wallets for large buys on watched tokens (Solana only)
 - **Anti-rug protection** — monitors liquidity of open positions; auto-sells immediately if liquidity drops below a floor or by a configurable percentage from entry
+- **Operator fee system** — configurable percentage fee on profitable trades, automatically transferred to admin wallet with full audit trail
 
 ## Prerequisites
 
@@ -91,6 +92,8 @@ Edit `.env` with your values:
 | `ANTIRUG_ENABLED` | Enable anti-rug liquidity protection | `true` |
 | `ANTIRUG_MIN_LIQ` | Emergency sell if liquidity drops below this USD amount | `1000` |
 | `ANTIRUG_LIQ_DROP_PCT` | Emergency sell if liquidity drops by this % from entry | `70` |
+| `OPERATOR_FEE_ENABLED` | Enable operator fee on profitable trades | `true` |
+| `OPERATOR_FEE_PCT` | Percentage of profit taken as operator fee | `5` |
 
 ## Docker (recommended)
 
@@ -181,6 +184,7 @@ The bot will connect to Telegram and send a startup message. Use commands to con
 | `/addwhale <address> [label]` | Track a whale/smart-money wallet |
 | `/removewhale <address>` | Stop tracking a whale wallet |
 | `/whales` | List tracked whale wallets & recent events |
+| `/fees` | Show operator fee revenue stats |
 
 ## Architecture
 
@@ -210,7 +214,8 @@ The bot will connect to Telegram and send a startup message. Use commands to con
                                           │
                                ┌──────────┴──────────┐
                                │       db.py          │
-                               │  (SQLite + wallets)  │
+                               │  (SQLite + wallets   │
+                               │   + fee_ledger)      │
                                └──────────┬──────────┘
                                           │
                                ┌──────────┴──────────┐
@@ -243,6 +248,7 @@ config.py ─── loaded by all modules (env vars + logger)
 | `monitor.py` | Background per-user profit-monitoring loop |
 | `notifier.py` | Telegram message formatting, per-user DMs, and broadcast alerts |
 | `bot.py` | Entry point — Telegram bot commands, scanner/monitor orchestration, wallet generation |
+| `fee_collector.py` | Operator fee calculation and SOL transfer logic |
 | `whale_tracker.py` | Background whale wallet tracker — monitors large DEX buys |
 
 ## Disclaimer

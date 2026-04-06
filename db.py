@@ -123,6 +123,20 @@ CREATE TABLE IF NOT EXISTS bot_chats (
 );
 """
 
+_CREATE_FEE_LEDGER = """
+CREATE TABLE IF NOT EXISTS fee_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_symbol TEXT NOT NULL,
+    trade_profit_native REAL NOT NULL,
+    fee_amount_native REAL NOT NULL,
+    fee_percent REAL NOT NULL,
+    fee_tx_hash TEXT,
+    status TEXT DEFAULT 'pending',   -- 'pending', 'submitted', 'collected', 'failed'
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 
 async def _conn() -> aiosqlite.Connection:
     db = await aiosqlite.connect(str(DB_PATH))
@@ -143,6 +157,7 @@ async def init_db():
         await db.execute(_CREATE_WHALE_EVENTS)
         await db.execute(_CREATE_USER_WALLETS)
         await db.execute(_CREATE_BOT_CHATS)
+        await db.execute(_CREATE_FEE_LEDGER)
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
         except Exception:
@@ -574,5 +589,71 @@ async def get_all_bot_chats() -> list[dict]:
     async with aiosqlite.connect(str(DB_PATH)) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM bot_chats ORDER BY added_at")
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def record_fee(
+    user_id: int,
+    token_symbol: str,
+    trade_profit: float,
+    fee_amount: float,
+    fee_pct: float,
+    tx_hash: str = "",
+    status: str = "pending",
+) -> int:
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        cursor = await db.execute(
+            "INSERT INTO fee_ledger (user_id, token_symbol, trade_profit_native, "
+            "fee_amount_native, fee_percent, fee_tx_hash, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, token_symbol, trade_profit, fee_amount, fee_pct, tx_hash, status),
+        )
+        await db.commit()
+        row_id = cursor.lastrowid
+    logger.debug("Recorded fee entry #%d for user %d (%s)", row_id, user_id, token_symbol)
+    return row_id
+
+
+async def update_fee_status(fee_id: int, status: str, tx_hash: str = ""):
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        if tx_hash:
+            await db.execute(
+                "UPDATE fee_ledger SET status = ?, fee_tx_hash = ? WHERE id = ?",
+                (status, tx_hash, fee_id),
+            )
+        else:
+            await db.execute(
+                "UPDATE fee_ledger SET status = ? WHERE id = ?",
+                (status, fee_id),
+            )
+        await db.commit()
+    logger.debug("Updated fee #%d status=%s", fee_id, status)
+
+
+async def get_fee_stats() -> dict:
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT "
+            "  COALESCE(SUM(CASE WHEN status='collected' THEN fee_amount_native ELSE 0 END), 0) AS total_collected, "
+            "  COALESCE(SUM(CASE WHEN status='pending' OR status='submitted' THEN fee_amount_native ELSE 0 END), 0) AS total_pending, "
+            "  COALESCE(SUM(CASE WHEN status='failed' THEN fee_amount_native ELSE 0 END), 0) AS total_failed, "
+            "  COUNT(*) AS count "
+            "FROM fee_ledger"
+        )
+        row = await cursor.fetchone()
+    if row is None:
+        return {"total_collected": 0, "total_pending": 0, "total_failed": 0, "count": 0}
+    return dict(row)
+
+
+async def get_fee_history(limit: int = 20) -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM fee_ledger ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]
