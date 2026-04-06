@@ -19,6 +19,7 @@ from config import (
     NATIVE_SYMBOL,
     SCAN_INTERVAL,
     SLIPPAGE,
+    STOP_LOSS,
     TAKE_PROFIT,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
@@ -186,7 +187,7 @@ async def cmd_start(update, context):
         "🚀 <b>Bot Started</b>\n\n"
         f"Chain: {CHAIN}\n"
         f"Wallet balance: {balance:.4f} {native}\n"
-        f"Buy: {BUY_PERCENT}% | TP: {TAKE_PROFIT}% | Slippage: {SLIPPAGE}%\n"
+        f"Buy: {BUY_PERCENT}% | TP: {TAKE_PROFIT}% | SL: {STOP_LOSS}% | Slippage: {SLIPPAGE}%\n"
         f"Scan every {SCAN_INTERVAL}s | Monitor every {MONITOR_INTERVAL}s\n"
         f"MCap: ${MIN_MCAP:,}–${MAX_MCAP:,} | Min Liq: ${MIN_LIQUIDITY:,}\n"
         f"Manual: /buy &lt;address&gt; [amount] | /sell &lt;address&gt; [percent]"
@@ -293,6 +294,7 @@ async def cmd_config(update, context):
         f"Chain: {CHAIN}\n"
         f"Buy Percent: {BUY_PERCENT}%\n"
         f"Take Profit: {TAKE_PROFIT}%\n"
+        f"Stop Loss: {STOP_LOSS}%\n"
         f"Slippage: {SLIPPAGE}%\n"
         f"Min Liquidity: ${MIN_LIQUIDITY:,}\n"
         f"Market Cap Range: ${MIN_MCAP:,} – ${MAX_MCAP:,}\n"

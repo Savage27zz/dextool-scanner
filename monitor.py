@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import aiohttp
 
 import db
-from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, TAKE_PROFIT, logger
+from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, STOP_LOSS, TAKE_PROFIT, logger
 
 
 class ProfitMonitor:
@@ -15,7 +15,7 @@ class ProfitMonitor:
 
     async def start(self):
         self.running = True
-        logger.info("ProfitMonitor started (interval=%ds, TP=%d%%)", MONITOR_INTERVAL, TAKE_PROFIT)
+        logger.info("ProfitMonitor started (interval=%ds, TP=%d%%, SL=%d%%)", MONITOR_INTERVAL, TAKE_PROFIT, STOP_LOSS)
         while self.running:
             try:
                 await self.check_positions()
@@ -54,9 +54,15 @@ class ProfitMonitor:
                 roi = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                 logger.debug("%s ROI: %.2f%% (entry=%.10f, current=%.10f)", symbol, roi, entry_price, current_price)
 
+                trigger = None
                 if roi >= TAKE_PROFIT:
+                    trigger = "tp"
                     logger.info("TP target hit for %s – ROI %.2f%% >= %d%%", symbol, roi, TAKE_PROFIT)
+                elif roi <= STOP_LOSS:
+                    trigger = "sl"
+                    logger.info("SL target hit for %s – ROI %.2f%% <= %d%%", symbol, roi, STOP_LOSS)
 
+                if trigger:
                     if chain.upper() == "SOL":
                         ui_balance, decimals = await self.trader.get_token_balance(token_address)
                         tokens_raw = int(ui_balance * (10**decimals)) if decimals > 0 else int(ui_balance * 1e9)
@@ -102,18 +108,30 @@ class ProfitMonitor:
 
                     duration_str = _format_duration(duration_seconds)
                     native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
-                    profit_native = sell_result["native_received"] - pos["buy_amount_native"]
+                    pnl_native = sell_result["native_received"] - pos["buy_amount_native"]
 
-                    await self.notifier.notify_take_profit(
-                        symbol=symbol,
-                        entry_price=entry_price,
-                        exit_price=sell_result["exit_price"],
-                        roi=round(roi, 2),
-                        profit_usd=profit_native,
-                        duration=duration_str,
-                        tx_hash=sell_result["tx_hash"],
-                        chain=chain,
-                    )
+                    if trigger == "tp":
+                        await self.notifier.notify_take_profit(
+                            symbol=symbol,
+                            entry_price=entry_price,
+                            exit_price=sell_result["exit_price"],
+                            roi=round(roi, 2),
+                            profit_usd=pnl_native,
+                            duration=duration_str,
+                            tx_hash=sell_result["tx_hash"],
+                            chain=chain,
+                        )
+                    else:
+                        await self.notifier.notify_stop_loss(
+                            symbol=symbol,
+                            entry_price=entry_price,
+                            exit_price=sell_result["exit_price"],
+                            roi=round(roi, 2),
+                            loss_native=abs(pnl_native),
+                            duration=duration_str,
+                            tx_hash=sell_result["tx_hash"],
+                            chain=chain,
+                        )
 
             except Exception as exc:
                 logger.error("Error checking position %s: %s", symbol, exc)

@@ -101,6 +101,29 @@ class Notifier:
         )
         await self.send_message(msg)
 
+    async def notify_stop_loss(
+        self,
+        symbol: str,
+        entry_price: float,
+        exit_price: float,
+        roi: float,
+        loss_native: float,
+        duration: str,
+        tx_hash: str,
+        chain: str,
+    ):
+        link = _tx_link(tx_hash, chain)
+        native = {"SOL": "SOL", "ETH": "ETH", "BSC": "BNB"}.get(chain.upper(), "SOL")
+        msg = (
+            f"\U0001f6d1 <b>STOP-LOSS \u2014 {roi:.2f}%</b>\n"
+            f"Token: {_esc(symbol)}\n"
+            f"Entry: {_fmt_price(entry_price)} \u2192 Exit: {_fmt_price(exit_price)}\n"
+            f"Loss: -{loss_native:.6f} {native}\n"
+            f"Duration: {duration}\n"
+            f"TX: {link}"
+        )
+        await self.send_message(msg)
+
     async def notify_error(self, error_msg: str):
         msg = f"⚠️ <b>ERROR</b>\n<code>{_esc(error_msg)}</code>"
         await self.send_message(msg)
