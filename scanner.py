@@ -12,8 +12,10 @@ from config import (
     MAX_MCAP,
     MIN_LIQUIDITY,
     MIN_MCAP,
+    MIN_SCORE,
     logger,
 )
+from scorer import score_token
 
 _HEADERS = {
     "X-API-Key": DEXTOOLS_API_KEY,
@@ -381,4 +383,19 @@ async def scan_all_sources(session: aiohttp.ClientSession, chain: str | None = N
         "Combined scan: %d from DexTools + %d from DexScreener = %d merged (%d unique)",
         len(dextools_results), len(dexscreener_results), len(merged), len(seen_addresses),
     )
-    return merged
+
+    # Score all tokens
+    scored = [score_token(t) for t in merged]
+
+    # Filter by minimum score
+    qualified = [t for t in scored if t.get("score", 0) >= MIN_SCORE]
+
+    # Sort by score descending (best first)
+    qualified.sort(key=lambda t: t.get("score", 0), reverse=True)
+
+    logger.info(
+        "Scoring: %d scored, %d passed MIN_SCORE=%d (rejected %d)",
+        len(scored), len(qualified), MIN_SCORE, len(scored) - len(qualified),
+    )
+
+    return qualified

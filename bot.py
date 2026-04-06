@@ -14,6 +14,7 @@ from config import (
     MAX_MCAP,
     MIN_LIQUIDITY,
     MIN_MCAP,
+    MIN_SCORE,
     MONITOR_INTERVAL,
     NATIVE_SYMBOL,
     SCAN_INTERVAL,
@@ -293,6 +294,7 @@ async def cmd_config(update, context):
         f"Slippage: {SLIPPAGE}%\n"
         f"Min Liquidity: ${MIN_LIQUIDITY:,}\n"
         f"Market Cap Range: ${MIN_MCAP:,} – ${MAX_MCAP:,}\n"
+        f"Min Safety Score: {MIN_SCORE}/100\n"
         f"Scan Interval: {SCAN_INTERVAL}s\n"
         f"Monitor Interval: {MONITOR_INTERVAL}s"
     )

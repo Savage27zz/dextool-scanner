@@ -2,6 +2,7 @@ from telegram import Bot
 from telegram.constants import ParseMode
 
 from config import EXPLORER_TX, logger
+from scorer import format_score_bar
 
 _MAX_MSG_LEN = 4096
 
@@ -41,6 +42,10 @@ class Notifier:
             links += f"🔗 DexScreener: {_esc(token.get('dex_pair_url', ''))}\n"
         links += f"📡 Source: {_esc(source)}"
 
+        score = token.get("score", 0)
+        score_bar = format_score_bar(score)
+        socials_str = _fmt_socials(token.get("social_links", {}))
+
         msg = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🔍 <b>NEW LOWCAP DETECTED</b>\n"
@@ -55,6 +60,8 @@ class Notifier:
             f"👥 Holders: {holders_str}\n"
             f"🧾 Buy Tax: {token.get('buy_tax', 0):.1f}% | Sell Tax: {token.get('sell_tax', 0):.1f}%\n"
             f"{links}\n"
+            + (f"🔗 Socials: {socials_str}\n" if socials_str else "")
+            + f"🛡️ Safety Score: {score_bar}\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⚙️ Action: Buying with {buy_amount:.4f} {native_symbol}"
         )
@@ -156,6 +163,27 @@ def _fmt_tokens(val) -> str:
     if v >= 1:
         return f"{v:,.4f}"
     return f"{v:.8f}"
+
+
+def _fmt_socials(social_links: dict) -> str:
+    """Format social links for Telegram message. Returns empty string if none."""
+    if not social_links or not isinstance(social_links, dict):
+        return ""
+    icons = {
+        "website": "🌐",
+        "twitter": "🐦",
+        "telegram": "💬",
+        "discord": "🎮",
+    }
+    parts = []
+    for key, url in social_links.items():
+        if url:
+            icon = icons.get(key, "🔗")
+            label = key.capitalize()
+            parts.append(f'{icon} <a href="{_esc(url)}">{label}</a>')
+    if not parts:
+        return ""
+    return " | ".join(parts)
 
 
 def _split_message(text: str) -> list[str]:

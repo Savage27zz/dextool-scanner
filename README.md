@@ -58,6 +58,7 @@ Edit `.env` with your values:
 | `MAX_MCAP` | Maximum market cap in USD | `500000` |
 | `SCAN_INTERVAL` | Seconds between DexTools scans | `60` |
 | `MONITOR_INTERVAL` | Seconds between position checks | `30` |
+| `MIN_SCORE` | Minimum safety score (0-100) for auto-buy | `40` |
 
 ## Usage
 

@@ -44,6 +44,8 @@ MIN_MCAP: int = _env("MIN_MCAP", default="10000", cast=int)
 SCAN_INTERVAL: int = _env("SCAN_INTERVAL", default="60", cast=int)
 MONITOR_INTERVAL: int = _env("MONITOR_INTERVAL", default="30", cast=int)
 
+MIN_SCORE: int = _env("MIN_SCORE", default="40", cast=int)
+
 DEXTOOLS_BASE_URL = f"https://public-api.dextools.io/{DEXTOOLS_PLAN}/v2"
 
 CHAIN_MAP = {
