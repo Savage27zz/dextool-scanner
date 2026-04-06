@@ -4,8 +4,9 @@ from datetime import datetime, timezone
 import aiohttp
 
 import db
-from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, STOP_LOSS, TAKE_PROFIT, TRAILING_DROP, TRAILING_ENABLED, ANTIRUG_ENABLED, ANTIRUG_MIN_LIQ, ANTIRUG_LIQ_DROP_PCT, logger
+from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, STOP_LOSS, TAKE_PROFIT, TRAILING_DROP, TRAILING_ENABLED, ANTIRUG_ENABLED, ANTIRUG_MIN_LIQ, ANTIRUG_LIQ_DROP_PCT, TELEGRAM_CHAT_ID, logger
 from dexscreener import get_token_liquidity
+from trader import create_user_trader, SolanaTrader
 
 
 class ProfitMonitor:
@@ -36,25 +37,26 @@ class ProfitMonitor:
             return await self.trader.get_token_price_via_jupiter(token_address)
         return await self.trader.get_token_price_onchain(token_address, chain)
 
-    async def _execute_sell_and_close(self, pos: dict, roi: float, reason: str) -> dict | None:
+    async def _execute_sell_and_close(self, pos: dict, roi: float, reason: str, user_trader: SolanaTrader | None = None, user_id: int = 0) -> dict | None:
+        trader_to_use = user_trader or self.trader
         token_address = pos["token_address"]
         chain = pos["chain"]
         symbol = pos["token_symbol"]
 
         if chain.upper() == "SOL":
-            ui_balance, decimals = await self.trader.get_token_balance(token_address)
+            ui_balance, decimals = await trader_to_use.get_token_balance(token_address)
             tokens_raw = int(ui_balance * (10**decimals)) if decimals > 0 else int(ui_balance * 1e9)
             if tokens_raw <= 0:
                 logger.warning("Zero balance for %s – skipping %s sell", symbol, reason)
                 return None
-            sell_result = await self.trader.sell_token(token_address, tokens_raw, decimals)
+            sell_result = await trader_to_use.sell_token(token_address, tokens_raw, decimals)
         else:
-            ui_balance, decimals = await self.trader.get_token_balance(token_address, chain)
+            ui_balance, decimals = await trader_to_use.get_token_balance(token_address, chain)
             tokens_raw = int(ui_balance * (10**decimals))
             if tokens_raw <= 0:
                 logger.warning("Zero balance for %s – skipping %s sell", symbol, reason)
                 return None
-            sell_result = await self.trader.sell_token(token_address, chain, tokens_raw, decimals)
+            sell_result = await trader_to_use.sell_token(token_address, chain, tokens_raw, decimals)
 
         if sell_result is None:
             logger.error("%s sell failed for %s", reason, symbol)
@@ -82,9 +84,19 @@ class ProfitMonitor:
             "duration_seconds": duration_seconds,
         }
 
-        await db.close_position(token_address, chain, exit_data)
+        await db.close_position(token_address, chain, exit_data, user_id=user_id)
         sell_result["duration_seconds"] = duration_seconds
         return sell_result
+
+    async def _admin_summary(self, user_id: int, reason: str, symbol: str, roi: float, native_amount: float):
+        if user_id == TELEGRAM_CHAT_ID or user_id == 0:
+            return
+        native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+        sign = "+" if native_amount >= 0 else ""
+        await self.notifier.send_message(
+            f"📋 User <code>{user_id}</code> {reason} {symbol} — "
+            f"ROI {roi:+.2f}% | {sign}{native_amount:.4f} {native}",
+        )
 
     async def check_positions(self):
         positions = await db.get_open_positions()
@@ -93,14 +105,29 @@ class ProfitMonitor:
 
         logger.debug("Checking %d open positions", len(positions))
 
+        _trader_cache: dict[int, SolanaTrader] = {}
+
         for pos in positions:
             token_address = pos["token_address"]
             chain = pos["chain"]
             entry_price = pos["entry_price"]
             symbol = pos["token_symbol"]
+            user_id = pos.get("user_id", 0)
+
+            if user_id not in _trader_cache:
+                if user_id == 0:
+                    _trader_cache[user_id] = self.trader
+                else:
+                    ut = await create_user_trader(user_id)
+                    if ut is None:
+                        logger.warning("No wallet for user %d, skipping position %s", user_id, symbol)
+                        continue
+                    _trader_cache[user_id] = ut
+
+            user_trader = _trader_cache[user_id]
+            notify_chat_id = user_id if user_id != 0 else None
 
             try:
-                # ── Anti-rug check (runs first, before price/TP/SL) ──
                 if ANTIRUG_ENABLED:
                     rug_detected = False
                     rug_reason = ""
@@ -130,7 +157,7 @@ class ProfitMonitor:
                         except Exception:
                             roi = -100
 
-                        sell_result = await self._execute_sell_and_close(pos, roi, "Anti-rug")
+                        sell_result = await self._execute_sell_and_close(pos, roi, "Anti-rug", user_trader=user_trader, user_id=user_id)
                         if sell_result:
                             native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
                             duration_str = _format_duration(sell_result["duration_seconds"])
@@ -145,10 +172,11 @@ class ProfitMonitor:
                                 tx_hash=sell_result["tx_hash"],
                                 chain=chain,
                                 reason=rug_reason,
+                                chat_id=notify_chat_id,
                             )
+                            await self._admin_summary(user_id, "Anti-rug sell", symbol, round(roi, 2), loss_native)
                         continue
 
-                # ── Price / TP / SL logic ──
                 current_price = await self._get_current_price(token_address, chain)
                 if current_price <= 0:
                     logger.debug("Could not get price for %s", symbol)
@@ -166,7 +194,7 @@ class ProfitMonitor:
                     if roi >= TAKE_PROFIT and not trailing_activated:
                         trailing_activated = True
                         peak_price = current_price
-                        await db.update_peak_price(token_address, chain, peak_price, True)
+                        await db.update_peak_price(token_address, chain, peak_price, True, user_id=user_id)
                         logger.info(
                             "Trailing activated for %s – ROI %.2f%%, peak=%.10f",
                             symbol, roi, peak_price,
@@ -175,13 +203,14 @@ class ProfitMonitor:
                         await self.notifier.send_message(
                             f"📈 <b>Trailing TP activated</b> for {symbol}\n"
                             f"ROI: {roi:+.2f}% | Peak: {peak_price:.10f} {native}\n"
-                            f"Will sell on {TRAILING_DROP}% drop from peak."
+                            f"Will sell on {TRAILING_DROP}% drop from peak.",
+                            chat_id=notify_chat_id,
                         )
 
                     elif trailing_activated:
                         if current_price > peak_price:
                             peak_price = current_price
-                            await db.update_peak_price(token_address, chain, peak_price, True)
+                            await db.update_peak_price(token_address, chain, peak_price, True, user_id=user_id)
                             logger.debug("New peak for %s: %.10f", symbol, peak_price)
                         else:
                             drop_from_peak = ((peak_price - current_price) / peak_price) * 100 if peak_price > 0 else 0
@@ -190,7 +219,7 @@ class ProfitMonitor:
                                     "Trailing sell for %s – dropped %.2f%% from peak %.10f",
                                     symbol, drop_from_peak, peak_price,
                                 )
-                                sell_result = await self._execute_sell_and_close(pos, roi, "Trailing-TP")
+                                sell_result = await self._execute_sell_and_close(pos, roi, "Trailing-TP", user_trader=user_trader, user_id=user_id)
                                 if sell_result:
                                     sold = True
                                     native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
@@ -205,12 +234,14 @@ class ProfitMonitor:
                                         duration=duration_str,
                                         tx_hash=sell_result["tx_hash"],
                                         chain=chain,
+                                        chat_id=notify_chat_id,
                                     )
+                                    await self._admin_summary(user_id, "Trailing-TP sell", symbol, round(roi, 2), profit_native)
 
                 else:
                     if roi >= TAKE_PROFIT:
                         logger.info("TP hit for %s – ROI %.2f%% >= %d%%", symbol, roi, TAKE_PROFIT)
-                        sell_result = await self._execute_sell_and_close(pos, roi, "Take-profit")
+                        sell_result = await self._execute_sell_and_close(pos, roi, "Take-profit", user_trader=user_trader, user_id=user_id)
                         if sell_result:
                             sold = True
                             native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
@@ -225,11 +256,13 @@ class ProfitMonitor:
                                 duration=duration_str,
                                 tx_hash=sell_result["tx_hash"],
                                 chain=chain,
+                                chat_id=notify_chat_id,
                             )
+                            await self._admin_summary(user_id, "Take-profit sell", symbol, round(roi, 2), profit_native)
 
                 if not sold and STOP_LOSS < 0 and roi <= STOP_LOSS:
                     logger.info("SL hit for %s – ROI %.2f%% <= %d%%", symbol, roi, STOP_LOSS)
-                    sell_result = await self._execute_sell_and_close(pos, roi, "Stop-loss")
+                    sell_result = await self._execute_sell_and_close(pos, roi, "Stop-loss", user_trader=user_trader, user_id=user_id)
                     if sell_result:
                         native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
                         duration_str = _format_duration(sell_result["duration_seconds"])
@@ -243,13 +276,15 @@ class ProfitMonitor:
                             duration=duration_str,
                             tx_hash=sell_result["tx_hash"],
                             chain=chain,
+                            chat_id=notify_chat_id,
                         )
+                        await self._admin_summary(user_id, "Stop-loss sell", symbol, round(roi, 2), loss_native)
 
             except Exception as exc:
                 logger.error("Error checking position %s: %s", symbol, exc)
 
-    async def get_positions_with_roi(self) -> list[dict]:
-        positions = await db.get_open_positions()
+    async def get_positions_with_roi(self, user_id: int | None = None) -> list[dict]:
+        positions = await db.get_open_positions(user_id=user_id)
         enriched = []
         for pos in positions:
             token_address = pos["token_address"]

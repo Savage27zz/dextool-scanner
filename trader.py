@@ -25,6 +25,15 @@ from config import (
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
+_shared_client: AsyncClient | None = None
+
+
+def _get_shared_client() -> AsyncClient:
+    global _shared_client
+    if _shared_client is None:
+        _shared_client = AsyncClient(RPC_URL_SOL, commitment=Confirmed)
+    return _shared_client
+
 JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 JUPITER_PRICE_URL = "https://api.jup.ag/price/v2"
@@ -170,9 +179,12 @@ def _load_solana_keypair(raw: str) -> Keypair:
 
 
 class SolanaTrader:
-    def __init__(self):
-        self.keypair = _load_solana_keypair(PRIVATE_KEY)
-        self.client = AsyncClient(RPC_URL_SOL, commitment=Confirmed)
+    def __init__(self, keypair: Keypair | None = None):
+        if keypair is not None:
+            self.keypair = keypair
+        else:
+            self.keypair = _load_solana_keypair(PRIVATE_KEY)
+        self.client = _get_shared_client()
         self.wallet = str(self.keypair.pubkey())
         logger.info("SolanaTrader initialised – wallet %s", self.wallet)
 
@@ -434,7 +446,18 @@ class SolanaTrader:
         logger.warning("Transaction confirmation timed out: %s", signature)
 
     async def close(self):
-        await self.client.close()
+        pass
+
+
+async def create_user_trader(user_id: int) -> SolanaTrader | None:
+    import db
+    from crypto_utils import decrypt_key
+    wallet_data = await db.get_user_wallet(user_id)
+    if not wallet_data:
+        return None
+    raw_key = decrypt_key(wallet_data["encrypted_private_key"])
+    keypair = Keypair.from_bytes(raw_key)
+    return SolanaTrader(keypair=keypair)
 
 
 class EVMTrader:

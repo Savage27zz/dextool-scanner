@@ -26,6 +26,7 @@ def _env(key: str, default=None, cast=None, required=False):
 TELEGRAM_BOT_TOKEN: str = _env("TELEGRAM_BOT_TOKEN", required=True)
 TELEGRAM_CHAT_ID: int = _env("TELEGRAM_CHAT_ID", cast=int, required=True)
 PRIVATE_KEY: str = _env("PRIVATE_KEY", required=True)
+ENCRYPTION_KEY: str = _env("ENCRYPTION_KEY", required=True)
 
 RPC_URL_SOL: str = _env("RPC_URL_SOL", default="https://api.mainnet-beta.solana.com")
 RPC_URL_ETH: str = _env("RPC_URL_ETH", default="")

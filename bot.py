@@ -4,6 +4,16 @@ import sys
 from datetime import datetime, timezone
 
 import aiohttp
+import base58 as b58
+from mnemonic import Mnemonic
+from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Confirmed
+from solders.system_program import TransferParams, transfer
+from solders.transaction import Transaction
+from solders.message import Message
 from telegram.ext import Application, CommandHandler
 
 import db
@@ -18,6 +28,8 @@ from config import (
     MIN_SCORE,
     MONITOR_INTERVAL,
     NATIVE_SYMBOL,
+    PRIVATE_KEY,
+    RPC_URL_SOL,
     SCAN_INTERVAL,
     SLIPPAGE,
     STOP_LOSS,
@@ -31,11 +43,12 @@ from config import (
     ANTIRUG_LIQ_DROP_PCT,
     logger,
 )
+from crypto_utils import encrypt_key, decrypt_key
 from monitor import ProfitMonitor, _format_duration
 from notifier import Notifier
 from honeypot import check_honeypot
 from scanner import scan_all_sources
-from trader import create_trader
+from trader import create_trader, create_user_trader, _load_solana_keypair, _get_shared_client
 from whale_tracker import WhaleTracker
 from config import WHALE_TRACKING_ENABLED, WHALE_CHECK_INTERVAL, WHALE_MIN_SOL
 
@@ -74,6 +87,33 @@ async def _reject_unauthorized(update) -> bool:
     return True
 
 
+async def _register_chat(update):
+    chat = update.effective_chat
+    if chat:
+        await db.upsert_bot_chat(chat.id, chat.type, chat.title or "")
+
+
+async def _get_user_trader(update):
+    user_id = update.effective_user.id
+    ut = await create_user_trader(user_id)
+    if ut is None:
+        await update.message.reply_text("No wallet found. Ask admin to run /adduser.")
+        return None
+    return ut
+
+
+def _generate_solana_wallet() -> tuple[Keypair, str]:
+    mnemo = Mnemonic("english")
+    seed_phrase = mnemo.generate(strength=128)
+    seed_bytes = Bip39SeedGenerator(seed_phrase).Generate()
+    bip44_ctx = Bip44.FromSeed(seed_bytes, Bip44Coins.SOLANA)
+    derived = bip44_ctx.Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT)
+    privkey_bytes = derived.PrivateKey().Raw().ToBytes()
+    pubkey_bytes = derived.PublicKey().RawCompressed().ToBytes()[1:]
+    kp = Keypair.from_bytes(privkey_bytes + pubkey_bytes)
+    return kp, seed_phrase
+
+
 async def scanner_loop():
     global is_running
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
@@ -88,47 +128,83 @@ async def scanner_loop():
                     try:
                         await db.save_detected_token(token)
 
-                        if CHAIN.upper() == "SOL":
-                            buy_amount = await trader.get_buy_amount()
-                        else:
-                            buy_amount = await trader.get_buy_amount(CHAIN)
-
-                        if buy_amount <= 0:
-                            logger.warning("Insufficient balance to buy %s", token["symbol"])
-                            continue
-
-                        await notifier.notify_new_token(token, buy_amount, native)
-
-                        if CHAIN.upper() == "SOL":
-                            result = await trader.buy_token(token["contract_address"], buy_amount)
-                        else:
-                            result = await trader.buy_token(token["contract_address"], CHAIN, buy_amount)
-
-                        if result is None:
-                            logger.error("Buy failed for %s", token["symbol"])
-                            await notifier.notify_error(f"Buy failed for {token['symbol']}")
-                            continue
-
-                        position = {
-                            "token_address": token["contract_address"],
-                            "token_symbol": token["symbol"],
-                            "chain": CHAIN.upper(),
-                            "entry_price": result["entry_price"],
-                            "tokens_received": result["tokens_received"],
-                            "buy_amount_native": result["amount_spent"],
-                            "buy_tx_hash": result["tx_hash"],
-                            "pair_address": token.get("pair_address", ""),
-                            "entry_liquidity": token.get("liquidity", 0),
-                        }
-                        await db.save_open_position(position)
-
-                        await notifier.notify_buy_executed(
-                            symbol=token["symbol"],
-                            tokens_received=result["tokens_received"],
-                            entry_price=result["entry_price"],
-                            tx_hash=result["tx_hash"],
-                            chain=CHAIN.upper(),
+                        alert_msg = (
+                            "━━━━━━━━━━━━━━━━━━━━━━\n"
+                            "🔍 <b>NEW LOWCAP DETECTED</b>\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🪙 {token.get('name', '?')} ({token.get('symbol', '?')})\n"
+                            f"📄 <code>{token.get('contract_address', '')}</code>\n"
+                            f"⛓ {token.get('chain', '')}\n"
+                            f"💰 MCap: ${token.get('market_cap', 0):,.0f}\n"
+                            f"💧 Liq: ${token.get('liquidity', 0):,.0f}\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━"
                         )
+                        await notifier.broadcast_alert(alert_msg)
+
+                        trading_users = await db.get_all_trading_users()
+                        if not trading_users:
+                            continue
+
+                        for user_wallet in trading_users:
+                            uid = user_wallet["user_id"]
+                            try:
+                                already = await db.is_token_already_bought(
+                                    token["contract_address"], CHAIN.upper(), uid
+                                )
+                                if already:
+                                    continue
+
+                                user_trader = await create_user_trader(uid)
+                                if user_trader is None:
+                                    continue
+
+                                buy_amount = await user_trader.get_buy_amount()
+                                if buy_amount <= 0:
+                                    continue
+
+                                await notifier.send_to_user(
+                                    uid,
+                                    f"⚙️ Buying {token.get('symbol', '?')} with {buy_amount:.4f} {native}..."
+                                )
+
+                                result = await user_trader.buy_token(
+                                    token["contract_address"], buy_amount
+                                )
+                                if result is None:
+                                    await notifier.send_to_user(uid, f"❌ Buy failed for {token.get('symbol', '?')}")
+                                    continue
+
+                                position = {
+                                    "token_address": token["contract_address"],
+                                    "token_symbol": token["symbol"],
+                                    "chain": CHAIN.upper(),
+                                    "entry_price": result["entry_price"],
+                                    "tokens_received": result["tokens_received"],
+                                    "buy_amount_native": result["amount_spent"],
+                                    "buy_tx_hash": result["tx_hash"],
+                                    "pair_address": token.get("pair_address", ""),
+                                    "entry_liquidity": token.get("liquidity", 0),
+                                    "user_id": uid,
+                                }
+                                await db.save_open_position(position)
+
+                                await notifier.notify_buy_executed(
+                                    symbol=token["symbol"],
+                                    tokens_received=result["tokens_received"],
+                                    entry_price=result["entry_price"],
+                                    tx_hash=result["tx_hash"],
+                                    chain=CHAIN.upper(),
+                                    chat_id=uid,
+                                )
+
+                                await notifier.send_message(
+                                    f"📋 User <code>{uid}</code> bought {token['symbol']} — "
+                                    f"{result['amount_spent']:.4f} {native}",
+                                )
+
+                            except Exception as exc:
+                                logger.error("Error buying %s for user %d: %s",
+                                           token.get("symbol"), uid, exc)
 
                     except Exception as exc:
                         logger.error("Error processing token %s: %s", token.get("symbol"), exc)
@@ -140,31 +216,39 @@ async def scanner_loop():
 
 
 async def cmd_help(update, context):
+    await _register_chat(update)
     is_admin = _is_admin(update)
     is_auth = await _is_authorized(update)
 
     lines = [
         "🤖 <b>DexTool Scanner Bot</b>\n",
-        "Scans DexTools for new low-cap tokens on Solana, auto-buys qualifying tokens, and takes profit automatically.\n",
+        "Scans for new low-cap tokens, auto-buys for each user's personal wallet, and takes profit automatically.\n",
     ]
 
     if is_auth:
         lines.append("<b>Commands:</b>")
         lines.append("/help — Show this message")
+        lines.append("/wallet — Your wallet address & balance")
         lines.append("/status — Open positions with live ROI")
         lines.append("/balance — Wallet balance")
         lines.append("/history — Last 10 completed trades")
+        lines.append("/portfolio — Full portfolio overview with PnL")
         lines.append("/config — Current bot configuration")
         lines.append("/buy &lt;address&gt; [amount] — Manual buy")
         lines.append("/sell &lt;address&gt; [percent] — Manual sell")
-        lines.append("/portfolio — Full portfolio overview with PnL")
+        lines.append("/autotrade on|off — Toggle auto-trading")
+        lines.append("/withdraw &lt;amount&gt; &lt;address&gt; — Withdraw SOL")
+        lines.append("/export — Export wallet credentials (DM only)")
         if is_admin:
             lines.append("\n<b>Admin only:</b>")
             lines.append("/start — Start scanning and trading")
             lines.append("/stop — Pause scanning and trading")
-            lines.append("/adduser &lt;user_id&gt; — Grant access")
-            lines.append("/removeuser &lt;user_id&gt; — Revoke access")
-            lines.append("/users — List authorized users")
+            lines.append("/adduser &lt;user_id&gt; — Grant access + generate wallet")
+            lines.append("/removeuser &lt;user_id&gt; — Revoke access + delete wallet")
+            lines.append("/users — List all users with wallet info")
+            lines.append("/chats — List active bot chats")
+            lines.append("/status all — All users' positions")
+            lines.append("/portfolio all — All users' portfolio")
             lines.append("/addwhale &lt;address&gt; [label] — Track a whale wallet")
             lines.append("/removewhale &lt;address&gt; — Stop tracking a whale wallet")
             lines.append("/whales — List tracked whales &amp; recent events")
@@ -177,6 +261,7 @@ async def cmd_help(update, context):
 
 
 async def cmd_start(update, context):
+    await _register_chat(update)
     if not _is_admin(update):
         await update.message.reply_text("Admin only.")
         return
@@ -199,20 +284,23 @@ async def cmd_start(update, context):
     else:
         balance = await trader.get_balance(CHAIN)
 
+    trading_users = await db.get_all_trading_users()
+
     msg = (
         "🚀 <b>Bot Started</b>\n\n"
         f"Chain: {CHAIN}\n"
-        f"Wallet balance: {balance:.4f} {native}\n"
+        f"Admin balance: {balance:.4f} {native}\n"
+        f"Active traders: {len(trading_users)}\n"
         f"Buy: {BUY_PERCENT}% | TP: {TAKE_PROFIT}% | Slippage: {SLIPPAGE}%\n"
         f"Scan every {SCAN_INTERVAL}s | Monitor every {MONITOR_INTERVAL}s\n"
-        f"MCap: ${MIN_MCAP:,}–${MAX_MCAP:,} | Min Liq: ${MIN_LIQUIDITY:,}\n"
-        f"Manual: /buy &lt;address&gt; [amount] | /sell &lt;address&gt; [percent]"
+        f"MCap: ${MIN_MCAP:,}–${MAX_MCAP:,} | Min Liq: ${MIN_LIQUIDITY:,}"
     )
     await update.message.reply_html(msg)
     logger.info("Bot started by user %s", update.effective_user.id)
 
 
 async def cmd_stop(update, context):
+    await _register_chat(update)
     if not _is_admin(update):
         await update.message.reply_text("Admin only.")
         return
@@ -243,51 +331,255 @@ async def cmd_stop(update, context):
     logger.info("Bot stopped by user %s", update.effective_user.id)
 
 
-async def cmd_status(update, context):
+async def cmd_wallet(update, context):
+    await _register_chat(update)
     if await _reject_unauthorized(update):
         return
 
-    positions = await monitor.get_positions_with_roi()
+    user_id = update.effective_user.id
+    wallet_data = await db.get_user_wallet(user_id)
+    if not wallet_data:
+        await update.message.reply_text("No wallet found. Ask admin to run /adduser.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    ut = await create_user_trader(user_id)
+    balance = await ut.get_balance() if ut else 0.0
+    auto_trade = "✅ Enabled" if wallet_data.get("auto_trade", 1) else "❌ Disabled"
+
+    await update.message.reply_html(
+        f"👛 <b>Your Wallet</b>\n"
+        f"Address: <code>{wallet_data['public_key']}</code>\n"
+        f"Balance: {balance:.6f} {native}\n"
+        f"Auto-Trade: {auto_trade}\n\n"
+        f"Send {native} to the address above to fund your trading wallet."
+    )
+
+
+async def cmd_autotrade(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    wallet_data = await db.get_user_wallet(user_id)
+    if not wallet_data:
+        await update.message.reply_text("No wallet found.")
+        return
+
+    if not context.args:
+        current = "on" if wallet_data.get("auto_trade", 1) else "off"
+        await update.message.reply_html(f"Usage: <code>/autotrade on|off</code>\nCurrent: {current}")
+        return
+
+    arg = context.args[0].lower()
+    if arg in ("on", "yes", "1", "true"):
+        await db.set_auto_trade(user_id, True)
+        await update.message.reply_text("✅ Auto-trading enabled.")
+    elif arg in ("off", "no", "0", "false"):
+        await db.set_auto_trade(user_id, False)
+        await update.message.reply_text("❌ Auto-trading paused.")
+    else:
+        await update.message.reply_html("Usage: <code>/autotrade on|off</code>")
+
+
+async def cmd_withdraw(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_html(
+            "Usage: <code>/withdraw &lt;amount&gt; &lt;destination_address&gt;</code>\n"
+            "Example: <code>/withdraw 0.5 ABC...XYZ</code>"
+        )
+        return
+
+    try:
+        amount = float(context.args[0])
+        if amount <= 0:
+            await update.message.reply_text("Amount must be positive.")
+            return
+    except ValueError:
+        await update.message.reply_text("Invalid amount.")
+        return
+
+    dest_str = context.args[1].strip()
+    try:
+        dest_pubkey = Pubkey.from_string(dest_str)
+    except Exception:
+        await update.message.reply_text("Invalid Solana address.")
+        return
+
+    user_id = update.effective_user.id
+    ut = await create_user_trader(user_id)
+    if ut is None:
+        await update.message.reply_text("No wallet found.")
+        return
+
+    balance = await ut.get_balance()
+    if amount > balance - 0.005:
+        await update.message.reply_html(
+            f"Insufficient balance. You have {balance:.6f} SOL (need ~0.005 for fees)."
+        )
+        return
+
+    await update.message.reply_html(f"🔄 Sending {amount:.6f} SOL to <code>{dest_str}</code>...")
+
+    try:
+        lamports = int(amount * 1e9)
+        client = _get_shared_client()
+        recent = await client.get_latest_blockhash()
+        blockhash = recent.value.blockhash
+
+        ix = transfer(TransferParams(
+            from_pubkey=ut.keypair.pubkey(),
+            to_pubkey=dest_pubkey,
+            lamports=lamports,
+        ))
+        msg = Message.new_with_blockhash([ix], ut.keypair.pubkey(), blockhash)
+        tx = Transaction.new_unsigned(msg)
+        tx.sign([ut.keypair], blockhash)
+
+        resp = await client.send_raw_transaction(
+            bytes(tx),
+            opts={"skip_preflight": True, "max_retries": 3},
+        )
+        sig = str(resp.value)
+
+        tx_url = EXPLORER_TX.get("SOL", "https://solscan.io/tx/{}").format(sig)
+        short = sig[:10] + "…" + sig[-6:]
+        await update.message.reply_html(
+            f"✅ <b>Withdrawal Sent</b>\n"
+            f"Amount: {amount:.6f} SOL\n"
+            f"To: <code>{dest_str}</code>\n"
+            f'TX: <a href="{tx_url}">{short}</a>'
+        )
+    except Exception as exc:
+        logger.error("Withdraw error for user %d: %s", user_id, exc)
+        await update.message.reply_html(f"❌ Withdrawal failed: <code>{str(exc)[:200]}</code>")
+
+
+async def cmd_export(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    if update.message.chat.type != "private":
+        await update.message.reply_text("⚠️ For security, please DM me directly with /export")
+        return
+
+    user_id = update.effective_user.id
+    wallet_data = await db.get_user_wallet(user_id)
+    if not wallet_data:
+        await update.message.reply_text("No wallet found.")
+        return
+
+    public_key = wallet_data["public_key"]
+
+    raw_key = decrypt_key(wallet_data["encrypted_private_key"])
+    privkey_b58 = b58.b58encode(raw_key).decode()
+
+    enc_seed = wallet_data.get("encrypted_seed_phrase", "")
+    if enc_seed:
+        seed_phrase = decrypt_key(enc_seed).decode()
+    else:
+        seed_phrase = None
+
+    seed_display = seed_phrase if seed_phrase else "N/A (imported wallet)"
+
+    await update.message.reply_html(
+        "🔑 <b>YOUR WALLET CREDENTIALS</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚠️ NEVER share these with anyone!\n"
+        "⚠️ Delete this message after saving!\n\n"
+        f"👛 Address:\n<code>{public_key}</code>\n\n"
+        f"🌱 Seed Phrase (12 words):\n<code>{seed_display}</code>\n\n"
+        f"🔐 Private Key (base58):\n<code>{privkey_b58}</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Import into Phantom or Solflare using either the seed phrase or private key."
+    )
+
+
+async def cmd_status(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    is_admin = _is_admin(update)
+
+    show_all = is_admin and context.args and context.args[0].lower() == "all"
+
+    if show_all:
+        positions = await monitor.get_positions_with_roi()
+    else:
+        positions = await monitor.get_positions_with_roi(user_id=user_id)
 
     if not positions:
         await update.message.reply_text("No open positions.")
         return
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    lines = ["📊 <b>Open Positions</b>\n"]
-    for p in positions:
-        roi = p.get("roi", 0)
-        arrow = "🟢" if roi >= 0 else "🔴"
-        lines.append(
-            f"{arrow} <b>{p['token_symbol']}</b> | ROI: {roi:+.2f}%\n"
-            f"   Entry: {p['entry_price']:.10f} {native}\n"
-            f"   Current: {p.get('current_price', 0):.10f} {native}\n"
-            f"   Amount: {p['tokens_received']:.4f} | Spent: {p['buy_amount_native']:.4f} {native}\n"
-        )
-        if p.get("trailing_activated"):
-            lines.append(f"   📈 Trailing active | Peak: {p.get('peak_price', 0):.10f} {native}")
+
+    if show_all:
+        by_user: dict[int, list] = {}
+        for p in positions:
+            uid = p.get("user_id", 0)
+            by_user.setdefault(uid, []).append(p)
+
+        lines = ["📊 <b>All Open Positions</b>\n"]
+        for uid, user_positions in by_user.items():
+            uw = await db.get_user_wallet(uid)
+            addr = uw["public_key"][:8] + "…" + uw["public_key"][-4:] if uw else "unknown"
+            lines.append(f"\n👤 User <code>{uid}</code> ({addr})")
+            for p in user_positions:
+                roi = p.get("roi", 0)
+                arrow = "🟢" if roi >= 0 else "🔴"
+                lines.append(
+                    f"  {arrow} <b>{p['token_symbol']}</b> ROI: {roi:+.2f}% | "
+                    f"Spent: {p['buy_amount_native']:.4f} {native}"
+                )
+    else:
+        lines = ["📊 <b>Open Positions</b>\n"]
+        for p in positions:
+            roi = p.get("roi", 0)
+            arrow = "🟢" if roi >= 0 else "🔴"
+            lines.append(
+                f"{arrow} <b>{p['token_symbol']}</b> | ROI: {roi:+.2f}%\n"
+                f"   Entry: {p['entry_price']:.10f} {native}\n"
+                f"   Current: {p.get('current_price', 0):.10f} {native}\n"
+                f"   Amount: {p['tokens_received']:.4f} | Spent: {p['buy_amount_native']:.4f} {native}\n"
+            )
+            if p.get("trailing_activated"):
+                lines.append(f"   📈 Trailing active | Peak: {p.get('peak_price', 0):.10f} {native}")
 
     await update.message.reply_html("\n".join(lines))
 
 
 async def cmd_balance(update, context):
+    await _register_chat(update)
     if await _reject_unauthorized(update):
         return
 
-    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    if CHAIN.upper() == "SOL":
-        balance = await trader.get_balance()
-    else:
-        balance = await trader.get_balance(CHAIN)
+    user_id = update.effective_user.id
+    ut = await create_user_trader(user_id)
+    if ut is None:
+        await update.message.reply_text("No wallet found.")
+        return
 
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    balance = await ut.get_balance()
     await update.message.reply_html(f"💰 <b>Wallet Balance</b>\n{balance:.6f} {native} ({CHAIN})")
 
 
 async def cmd_history(update, context):
+    await _register_chat(update)
     if await _reject_unauthorized(update):
         return
 
-    trades = await db.get_trade_history(limit=10)
+    user_id = update.effective_user.id
+    trades = await db.get_trade_history(limit=10, user_id=user_id)
 
     if not trades:
         await update.message.reply_text("No completed trades.")
@@ -309,6 +601,7 @@ async def cmd_history(update, context):
 
 
 async def cmd_config(update, context):
+    await _register_chat(update)
     if await _reject_unauthorized(update):
         return
 
@@ -338,6 +631,7 @@ async def cmd_config(update, context):
 
 
 async def cmd_buy(update, context):
+    await _register_chat(update)
     if await _reject_unauthorized(update):
         return
 
@@ -347,6 +641,12 @@ async def cmd_buy(update, context):
             "Example: <code>/buy So1abc...xyz 0.5</code>\n"
             "If amount is omitted, uses configured BUY_PERCENT% of balance."
         )
+        return
+
+    user_id = update.effective_user.id
+    user_trader = await create_user_trader(user_id)
+    if user_trader is None:
+        await update.message.reply_text("No wallet found.")
         return
 
     token_address = context.args[0].strip()
@@ -362,16 +662,13 @@ async def cmd_buy(update, context):
             await update.message.reply_text("Invalid amount. Must be a number.")
             return
     else:
-        if CHAIN.upper() == "SOL":
-            buy_amount = await trader.get_buy_amount()
-        else:
-            buy_amount = await trader.get_buy_amount(CHAIN)
+        buy_amount = await user_trader.get_buy_amount()
 
     if buy_amount <= 0:
         await update.message.reply_text(f"Insufficient {native} balance.")
         return
 
-    already = await db.is_token_already_bought(token_address, CHAIN.upper())
+    already = await db.is_token_already_bought(token_address, CHAIN.upper(), user_id)
     if already:
         await update.message.reply_text("Already holding a position in this token.")
         return
@@ -395,14 +692,11 @@ async def cmd_buy(update, context):
         f"Executing..."
     )
 
-    if CHAIN.upper() == "SOL":
-        result = await trader.buy_token(token_address, buy_amount)
-    else:
-        result = await trader.buy_token(token_address, CHAIN, buy_amount)
+    result = await user_trader.buy_token(token_address, buy_amount)
 
     if result is None:
         await update.message.reply_html("\u274c <b>Buy failed.</b> Check logs for details.")
-        logger.error("Manual buy failed for %s", token_address)
+        logger.error("Manual buy failed for %s (user %d)", token_address, user_id)
         return
 
     symbol = token_address[:8]
@@ -425,6 +719,7 @@ async def cmd_buy(update, context):
         "buy_tx_hash": result["tx_hash"],
         "pair_address": "",
         "entry_liquidity": entry_liq,
+        "user_id": user_id,
     }
     await db.save_open_position(position)
 
@@ -434,12 +729,20 @@ async def cmd_buy(update, context):
         entry_price=result["entry_price"],
         tx_hash=result["tx_hash"],
         chain=CHAIN.upper(),
+        chat_id=user_id,
     )
 
-    logger.info("Manual buy executed: %s, tx=%s", token_address, result["tx_hash"])
+    if not _is_admin(update):
+        await notifier.send_message(
+            f"📋 User <code>{user_id}</code> manual buy {symbol} — "
+            f"{result['amount_spent']:.4f} {native}",
+        )
+
+    logger.info("Manual buy executed: %s, user=%d, tx=%s", token_address, user_id, result["tx_hash"])
 
 
 async def cmd_sell(update, context):
+    await _register_chat(update)
     if await _reject_unauthorized(update):
         return
 
@@ -449,6 +752,12 @@ async def cmd_sell(update, context):
             "Example: <code>/sell So1abc...xyz 50</code> (sell 50%)\n"
             "If percent is omitted, sells 100% of holdings."
         )
+        return
+
+    user_id = update.effective_user.id
+    user_trader = await create_user_trader(user_id)
+    if user_trader is None:
+        await update.message.reply_text("No wallet found.")
         return
 
     token_address = context.args[0].strip()
@@ -465,10 +774,7 @@ async def cmd_sell(update, context):
             await update.message.reply_text("Invalid percent. Must be a number.")
             return
 
-    if CHAIN.upper() == "SOL":
-        ui_balance, decimals = await trader.get_token_balance(token_address)
-    else:
-        ui_balance, decimals = await trader.get_token_balance(token_address, CHAIN)
+    ui_balance, decimals = await user_trader.get_token_balance(token_address)
 
     if ui_balance <= 0:
         await update.message.reply_text("No tokens to sell \u2014 zero balance.")
@@ -491,18 +797,15 @@ async def cmd_sell(update, context):
         f"Executing..."
     )
 
-    if CHAIN.upper() == "SOL":
-        result = await trader.sell_token(token_address, sell_raw, decimals)
-    else:
-        result = await trader.sell_token(token_address, CHAIN, sell_raw, decimals)
+    result = await user_trader.sell_token(token_address, sell_raw, decimals)
 
     if result is None:
         await update.message.reply_html("\u274c <b>Sell failed.</b> Check logs for details.")
-        logger.error("Manual sell failed for %s", token_address)
+        logger.error("Manual sell failed for %s (user %d)", token_address, user_id)
         return
 
     if sell_percent == 100:
-        positions = await db.get_open_positions()
+        positions = await db.get_open_positions(user_id=user_id)
         for pos in positions:
             if pos["token_address"].lower() == token_address.lower() and pos["chain"] == CHAIN.upper():
                 entry_price = pos["entry_price"]
@@ -528,7 +831,7 @@ async def cmd_sell(update, context):
                     "sell_tx_hash": result["tx_hash"],
                     "duration_seconds": duration_seconds,
                 }
-                await db.close_position(pos["token_address"], CHAIN.upper(), exit_data)
+                await db.close_position(pos["token_address"], CHAIN.upper(), exit_data, user_id=user_id)
                 break
 
     tx_url = EXPLORER_TX.get(CHAIN.upper(), EXPLORER_TX["SOL"]).format(result["tx_hash"])
@@ -542,22 +845,76 @@ async def cmd_sell(update, context):
         f'TX: <a href="{tx_url}">{short_hash}</a>'
     )
 
-    logger.info("Manual sell executed: %s (%d%%), tx=%s", token_address, sell_percent, result["tx_hash"])
+    if not _is_admin(update):
+        await notifier.send_message(
+            f"📋 User <code>{user_id}</code> manual sell {token_address[:8]}… — "
+            f"received {result['native_received']:.4f} {native}",
+        )
+
+    logger.info("Manual sell executed: %s (%d%%), user=%d, tx=%s", token_address, sell_percent, user_id, result["tx_hash"])
 
 
 async def cmd_portfolio(update, context):
-    if not _is_admin(update):
-        await update.message.reply_text("Admin only.")
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
         return
+
+    user_id = update.effective_user.id
+    is_admin = _is_admin(update)
+    show_all = is_admin and context.args and context.args[0].lower() == "all"
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
 
-    if CHAIN.upper() == "SOL":
-        wallet_balance = await trader.get_balance()
-    else:
-        wallet_balance = await trader.get_balance(CHAIN)
+    if show_all:
+        trading_users = await db.get_all_trading_users()
+        all_users = [u["user_id"] for u in trading_users]
+        if TELEGRAM_CHAT_ID not in all_users:
+            all_users.insert(0, TELEGRAM_CHAT_ID)
 
-    positions = await monitor.get_positions_with_roi()
+        msg_parts = [
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            "💼 <b>ALL USERS PORTFOLIO</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        grand_total = 0.0
+
+        for uid in all_users:
+            ut = await create_user_trader(uid)
+            if ut is None:
+                continue
+            bal = await ut.get_balance()
+            positions = await monitor.get_positions_with_roi(user_id=uid)
+            pos_value = sum(
+                (p.get("current_price", 0) * p.get("tokens_received", 0)) if p.get("current_price", 0) > 0 else p.get("buy_amount_native", 0)
+                for p in positions
+            )
+            total = bal + pos_value
+            grand_total += total
+
+            uw = await db.get_user_wallet(uid)
+            addr = uw["public_key"][:8] + "…" + uw["public_key"][-4:] if uw else "?"
+
+            msg_parts.append(
+                f"\n👤 <code>{uid}</code> ({addr})\n"
+                f"   💰 Balance: {bal:.4f} {native}\n"
+                f"   📦 Positions: {len(positions)} ({pos_value:.4f} {native})\n"
+                f"   📊 Total: {total:.4f} {native}"
+            )
+
+        msg_parts.append(f"\n━━━━━━━━━━━━━━━━━━━━━━")
+        msg_parts.append(f"💎 Grand Total: {grand_total:.4f} {native}")
+
+        await update.message.reply_html("\n".join(msg_parts))
+        return
+
+    ut = await create_user_trader(user_id)
+    if ut is None:
+        await update.message.reply_text("No wallet found.")
+        return
+
+    wallet_balance = await ut.get_balance()
+    positions = await monitor.get_positions_with_roi(user_id=user_id)
 
     total_invested = 0.0
     total_current_value = 0.0
@@ -566,7 +923,6 @@ async def cmd_portfolio(update, context):
     for p in positions:
         invested = p.get("buy_amount_native", 0)
         tokens = p.get("tokens_received", 0)
-        entry = p.get("entry_price", 0)
         current = p.get("current_price", 0)
         roi = p.get("roi", 0)
         symbol = p.get("token_symbol", "???")
@@ -602,7 +958,7 @@ async def cmd_portfolio(update, context):
             line += " \u26a0\ufe0f price unavailable"
         position_lines.append(line)
 
-    trades = await db.get_trade_history(limit=100)
+    trades = await db.get_trade_history(limit=100, user_id=user_id)
     realized_pnl = 0.0
     total_trades = len(trades)
     winning_trades = 0
@@ -658,6 +1014,7 @@ async def cmd_portfolio(update, context):
 
 
 async def cmd_adduser(update, context):
+    await _register_chat(update)
     if not _is_admin(update):
         await update.message.reply_text("Admin only.")
         return
@@ -674,10 +1031,30 @@ async def cmd_adduser(update, context):
 
     username = context.args[1] if len(context.args) > 1 else ""
     await db.add_allowed_user(user_id, username)
-    await update.message.reply_html(f"✅ User <code>{user_id}</code> has been granted access.")
+
+    existing_wallet = await db.get_user_wallet(user_id)
+    if existing_wallet:
+        await update.message.reply_html(
+            f"✅ User <code>{user_id}</code> granted access.\n"
+            f"👛 Wallet already exists: <code>{existing_wallet['public_key']}</code>"
+        )
+        return
+
+    kp, seed_phrase = _generate_solana_wallet()
+    public_key = str(kp.pubkey())
+    encrypted_pk = encrypt_key(bytes(kp))
+    encrypted_seed = encrypt_key(seed_phrase.encode())
+    await db.save_user_wallet(user_id, public_key, encrypted_pk, encrypted_seed)
+
+    await update.message.reply_html(
+        f"✅ User <code>{user_id}</code> granted access.\n"
+        f"👛 Wallet generated: <code>{public_key}</code>\n"
+        f"They should fund this address with SOL to start trading."
+    )
 
 
 async def cmd_removeuser(update, context):
+    await _register_chat(update)
     if not _is_admin(update):
         await update.message.reply_text("Admin only.")
         return
@@ -692,14 +1069,31 @@ async def cmd_removeuser(update, context):
         await update.message.reply_text("Invalid user ID. Must be a number.")
         return
 
+    warn_parts = []
+    open_positions = await db.get_open_positions(user_id=user_id)
+    if open_positions:
+        warn_parts.append(f"{len(open_positions)} open position(s)")
+
+    ut = await create_user_trader(user_id)
+    if ut:
+        bal = await ut.get_balance()
+        if bal > 0.001:
+            warn_parts.append(f"{bal:.4f} SOL balance")
+
     removed = await db.remove_allowed_user(user_id)
+    await db.delete_user_wallet(user_id)
+
     if removed:
-        await update.message.reply_html(f"🚫 User <code>{user_id}</code> access revoked.")
+        msg = f"🚫 User <code>{user_id}</code> access revoked."
+        if warn_parts:
+            msg += f"\n⚠️ User had {' and '.join(warn_parts)}."
+        await update.message.reply_html(msg)
     else:
         await update.message.reply_html(f"User <code>{user_id}</code> was not in the list.")
 
 
 async def cmd_users(update, context):
+    await _register_chat(update)
     if not _is_admin(update):
         await update.message.reply_text("Admin only.")
         return
@@ -709,15 +1103,55 @@ async def cmd_users(update, context):
         await update.message.reply_text("No authorized users (besides admin).")
         return
 
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     lines = ["👥 <b>Authorized Users</b>\n"]
     for u in users:
+        uid = u["user_id"]
         name = u.get("username") or "—"
-        lines.append(f"• <code>{u['user_id']}</code> ({name}) — added {u.get('added_at', '?')}")
+        uw = await db.get_user_wallet(uid)
+        if uw:
+            addr = uw["public_key"]
+            auto = "✅" if uw.get("auto_trade", 1) else "❌"
+            ut = await create_user_trader(uid)
+            bal = await ut.get_balance() if ut else 0.0
+            positions = await db.get_open_positions(user_id=uid)
+            lines.append(
+                f"• <code>{uid}</code> ({name}) — {auto} auto-trade\n"
+                f"   👛 <code>{addr}</code>\n"
+                f"   💰 {bal:.4f} {native} | 📦 {len(positions)} position(s)"
+            )
+        else:
+            lines.append(f"• <code>{uid}</code> ({name}) — no wallet")
+
+    await update.message.reply_html("\n".join(lines))
+
+
+async def cmd_chats(update, context):
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    chats = await db.get_all_bot_chats()
+    if not chats:
+        await update.message.reply_text("No active chats.")
+        return
+
+    lines = ["📢 <b>Active Chats</b>\n"]
+    for c in chats:
+        cid = c["chat_id"]
+        ctype = c.get("chat_type", "private")
+        title = c.get("title", "")
+        if ctype == "private":
+            lines.append(f"• DM: {title or 'user'} (<code>{cid}</code>)")
+        else:
+            lines.append(f"• {ctype.capitalize()}: \"{title}\" (<code>{cid}</code>)")
 
     await update.message.reply_html("\n".join(lines))
 
 
 async def cmd_addwhale(update, context):
+    await _register_chat(update)
     if not _is_admin(update):
         await update.message.reply_text("Admin only.")
         return
@@ -729,7 +1163,6 @@ async def cmd_addwhale(update, context):
     address = context.args[0].strip()
 
     try:
-        import base58 as b58
         decoded = b58.b58decode(address)
         if len(decoded) != 32:
             raise ValueError("not 32 bytes")
@@ -750,6 +1183,7 @@ async def cmd_addwhale(update, context):
 
 
 async def cmd_removewhale(update, context):
+    await _register_chat(update)
     if not _is_admin(update):
         await update.message.reply_text("Admin only.")
         return
@@ -768,6 +1202,7 @@ async def cmd_removewhale(update, context):
 
 
 async def cmd_whales(update, context):
+    await _register_chat(update)
     if not _is_admin(update):
         await update.message.reply_text("Admin only.")
         return
@@ -811,17 +1246,30 @@ async def post_init(application):
     if CHAIN.upper() == "SOL" and WHALE_TRACKING_ENABLED:
         whale_tracker = WhaleTracker(trader.client, notifier)
 
+    admin_wallet = await db.get_user_wallet(TELEGRAM_CHAT_ID)
+    if not admin_wallet:
+        admin_kp = _load_solana_keypair(PRIVATE_KEY)
+        encrypted_admin = encrypt_key(bytes(admin_kp))
+        await db.save_user_wallet(TELEGRAM_CHAT_ID, str(admin_kp.pubkey()), encrypted_admin, "")
+
+    await db.migrate_legacy_positions(TELEGRAM_CHAT_ID)
+
+    await db.upsert_bot_chat(TELEGRAM_CHAT_ID, "private", "admin")
+
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     if CHAIN.upper() == "SOL":
         balance = await trader.get_balance()
     else:
         balance = await trader.get_balance(CHAIN)
 
-    logger.info("Bot initialised – chain=%s, balance=%.6f %s", CHAIN, balance, native)
+    trading_users = await db.get_all_trading_users()
+
+    logger.info("Bot initialised – chain=%s, balance=%.6f %s, traders=%d", CHAIN, balance, native, len(trading_users))
     scanner_mode = "DexTools + DexScreener" if DEXTOOLS_API_KEY else "DexScreener only (free)"
     await notifier.send_message(
         f"🤖 <b>DexTool Scanner Online</b>\n"
         f"Chain: {CHAIN} | Balance: {balance:.4f} {native}\n"
+        f"Active traders: {len(trading_users)}\n"
         f"Scanner: {scanner_mode}\n"
         f"Send /start to begin scanning."
     )
@@ -853,6 +1301,10 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("wallet", cmd_wallet))
+    app.add_handler(CommandHandler("autotrade", cmd_autotrade))
+    app.add_handler(CommandHandler("withdraw", cmd_withdraw))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("history", cmd_history))
@@ -863,6 +1315,7 @@ def main():
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
     app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CommandHandler("addwhale", cmd_addwhale))
     app.add_handler(CommandHandler("removewhale", cmd_removewhale))
     app.add_handler(CommandHandler("whales", cmd_whales))

@@ -7,3 +7,6 @@ aiohttp==3.11.12
 aiosqlite==0.20.0
 httpx>=0.28.0
 base58>=2.1.0
+cryptography>=43.0.0
+mnemonic>=0.20
+bip_utils>=2.9.0

@@ -46,8 +46,9 @@ CREATE TABLE IF NOT EXISTS open_positions (
     peak_price REAL DEFAULT 0,
     trailing_activated INTEGER DEFAULT 0,
     entry_liquidity REAL DEFAULT 0,
+    user_id INTEGER DEFAULT 0,
     opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(token_address, chain)
+    UNIQUE(token_address, chain, user_id)
 );
 """
 
@@ -68,7 +69,8 @@ CREATE TABLE IF NOT EXISTS completed_trades (
     sell_tx_hash TEXT NOT NULL,
     opened_at TIMESTAMP NOT NULL,
     closed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    duration_seconds INTEGER
+    duration_seconds INTEGER,
+    user_id INTEGER DEFAULT 0
 );
 """
 
@@ -101,6 +103,26 @@ CREATE TABLE IF NOT EXISTS whale_events (
 );
 """
 
+_CREATE_USER_WALLETS = """
+CREATE TABLE IF NOT EXISTS user_wallets (
+    user_id INTEGER PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    encrypted_private_key TEXT NOT NULL,
+    encrypted_seed_phrase TEXT NOT NULL DEFAULT '',
+    auto_trade INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+_CREATE_BOT_CHATS = """
+CREATE TABLE IF NOT EXISTS bot_chats (
+    chat_id INTEGER PRIMARY KEY,
+    chat_type TEXT DEFAULT 'private',
+    title TEXT DEFAULT '',
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 
 async def _conn() -> aiosqlite.Connection:
     db = await aiosqlite.connect(str(DB_PATH))
@@ -119,19 +141,32 @@ async def init_db():
         await db.execute(_CREATE_ALLOWED_USERS)
         await db.execute(_CREATE_WHALE_WALLETS)
         await db.execute(_CREATE_WHALE_EVENTS)
-        # Migration: add trailing columns if they don't exist
+        await db.execute(_CREATE_USER_WALLETS)
+        await db.execute(_CREATE_BOT_CHATS)
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
         except Exception:
-            pass  # column already exists
+            pass
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN trailing_activated INTEGER DEFAULT 0")
         except Exception:
-            pass  # column already exists
+            pass
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN entry_liquidity REAL DEFAULT 0")
         except Exception:
-            pass  # column already exists
+            pass
+        try:
+            await db.execute("ALTER TABLE open_positions ADD COLUMN user_id INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE completed_trades ADD COLUMN user_id INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE user_wallets ADD COLUMN encrypted_seed_phrase TEXT DEFAULT ''")
+        except Exception:
+            pass
         await db.commit()
     logger.info("Database initialised at %s", DB_PATH)
 
@@ -176,8 +211,8 @@ async def save_open_position(position: dict):
     sql = """
         INSERT INTO open_positions
             (token_address, token_symbol, chain, entry_price, tokens_received,
-             buy_amount_native, buy_tx_hash, pair_address, entry_liquidity)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             buy_amount_native, buy_tx_hash, pair_address, entry_liquidity, user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         position["token_address"],
@@ -189,32 +224,38 @@ async def save_open_position(position: dict):
         position["buy_tx_hash"],
         position.get("pair_address"),
         position.get("entry_liquidity", 0),
+        position.get("user_id", 0),
     )
     async with aiosqlite.connect(str(DB_PATH)) as db:
         await db.execute(sql, params)
         await db.commit()
-    logger.info("Saved open position for %s on %s", position["token_symbol"], position["chain"])
+    logger.info("Saved open position for %s on %s (user %d)", position["token_symbol"], position["chain"], position.get("user_id", 0))
 
 
-async def get_open_positions() -> list[dict]:
-    sql = "SELECT * FROM open_positions ORDER BY opened_at DESC"
+async def get_open_positions(user_id: int | None = None) -> list[dict]:
+    if user_id is not None:
+        sql = "SELECT * FROM open_positions WHERE user_id = ? ORDER BY opened_at DESC"
+        params: tuple = (user_id,)
+    else:
+        sql = "SELECT * FROM open_positions ORDER BY opened_at DESC"
+        params = ()
     async with aiosqlite.connect(str(DB_PATH)) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(sql)
+        cursor = await db.execute(sql, params)
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 
 
-async def close_position(token_address: str, chain: str, exit_data: dict):
+async def close_position(token_address: str, chain: str, exit_data: dict, user_id: int = 0):
     async with aiosqlite.connect(str(DB_PATH)) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT * FROM open_positions WHERE token_address = ? AND chain = ?",
-            (token_address, chain),
+            "SELECT * FROM open_positions WHERE token_address = ? AND chain = ? AND user_id = ?",
+            (token_address, chain, user_id),
         )
         row = await cursor.fetchone()
         if row is None:
-            logger.warning("close_position: no open position for %s on %s", token_address, chain)
+            logger.warning("close_position: no open position for %s on %s user %d", token_address, chain, user_id)
             return
         pos = dict(row)
 
@@ -225,8 +266,8 @@ async def close_position(token_address: str, chain: str, exit_data: dict):
             INSERT INTO completed_trades
                 (token_address, token_symbol, chain, entry_price, exit_price,
                  tokens_amount, buy_amount_native, sell_amount_native, profit_usd,
-                 roi_percent, buy_tx_hash, sell_tx_hash, opened_at, duration_seconds)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 roi_percent, buy_tx_hash, sell_tx_hash, opened_at, duration_seconds, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         params = (
             pos["token_address"],
@@ -243,26 +284,33 @@ async def close_position(token_address: str, chain: str, exit_data: dict):
             exit_data["sell_tx_hash"],
             opened_at,
             duration,
+            user_id,
         )
         await db.execute(insert_sql, params)
         await db.execute(
-            "DELETE FROM open_positions WHERE token_address = ? AND chain = ?",
-            (token_address, chain),
+            "DELETE FROM open_positions WHERE token_address = ? AND chain = ? AND user_id = ?",
+            (token_address, chain, user_id),
         )
         await db.commit()
     logger.info(
-        "Closed position %s on %s | ROI %.2f%%",
+        "Closed position %s on %s user %d | ROI %.2f%%",
         pos["token_symbol"],
         chain,
+        user_id,
         exit_data["roi_percent"],
     )
 
 
-async def get_trade_history(limit: int = 10) -> list[dict]:
-    sql = "SELECT * FROM completed_trades ORDER BY closed_at DESC LIMIT ?"
+async def get_trade_history(limit: int = 10, user_id: int | None = None) -> list[dict]:
+    if user_id is not None:
+        sql = "SELECT * FROM completed_trades WHERE user_id = ? ORDER BY closed_at DESC LIMIT ?"
+        params: tuple = (user_id, limit)
+    else:
+        sql = "SELECT * FROM completed_trades ORDER BY closed_at DESC LIMIT ?"
+        params = (limit,)
     async with aiosqlite.connect(str(DB_PATH)) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(sql, (limit,))
+        cursor = await db.execute(sql, params)
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 
@@ -303,15 +351,14 @@ async def is_user_allowed(user_id: int) -> bool:
         return await cursor.fetchone() is not None
 
 
-async def update_peak_price(token_address: str, chain: str, peak_price: float, trailing_activated: bool):
-    """Update the peak price and trailing activation status for an open position."""
+async def update_peak_price(token_address: str, chain: str, peak_price: float, trailing_activated: bool, user_id: int = 0):
     sql = """
         UPDATE open_positions 
         SET peak_price = ?, trailing_activated = ?
-        WHERE token_address = ? AND chain = ?
+        WHERE token_address = ? AND chain = ? AND user_id = ?
     """
     async with aiosqlite.connect(str(DB_PATH)) as db_conn:
-        await db_conn.execute(sql, (peak_price, int(trailing_activated), token_address, chain))
+        await db_conn.execute(sql, (peak_price, int(trailing_activated), token_address, chain, user_id))
         await db_conn.commit()
 
 
@@ -394,18 +441,108 @@ async def is_token_watched(token_mint: str, chain: str = "SOL") -> dict | None:
     return None
 
 
-async def is_token_already_bought(contract_address: str, chain: str) -> bool:
+async def is_token_already_bought(contract_address: str, chain: str, user_id: int = 0) -> bool:
     async with aiosqlite.connect(str(DB_PATH)) as db:
         cur1 = await db.execute(
-            "SELECT 1 FROM open_positions WHERE token_address = ? AND chain = ? LIMIT 1",
-            (contract_address, chain),
+            "SELECT 1 FROM open_positions WHERE token_address = ? AND chain = ? AND user_id = ? LIMIT 1",
+            (contract_address, chain, user_id),
         )
         if await cur1.fetchone():
             return True
         cur2 = await db.execute(
-            "SELECT 1 FROM completed_trades WHERE token_address = ? AND chain = ? LIMIT 1",
-            (contract_address, chain),
+            "SELECT 1 FROM completed_trades WHERE token_address = ? AND chain = ? AND user_id = ? LIMIT 1",
+            (contract_address, chain, user_id),
         )
         if await cur2.fetchone():
             return True
     return False
+
+
+async def save_user_wallet(user_id: int, public_key: str, encrypted_private_key: str, encrypted_seed_phrase: str = ""):
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO user_wallets (user_id, public_key, encrypted_private_key, encrypted_seed_phrase) VALUES (?, ?, ?, ?)",
+            (user_id, public_key, encrypted_private_key, encrypted_seed_phrase),
+        )
+        await db.commit()
+    logger.info("Saved wallet for user %d (pubkey %s)", user_id, public_key[:16] + "...")
+
+
+async def get_user_wallet(user_id: int) -> dict | None:
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM user_wallets WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def get_all_trading_users() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM user_wallets WHERE auto_trade = 1"
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def set_auto_trade(user_id: int, enabled: bool):
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute(
+            "UPDATE user_wallets SET auto_trade = ? WHERE user_id = ?",
+            (1 if enabled else 0, user_id),
+        )
+        await db.commit()
+    logger.info("Set auto_trade=%s for user %d", enabled, user_id)
+
+
+async def delete_user_wallet(user_id: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        cursor = await db.execute(
+            "DELETE FROM user_wallets WHERE user_id = ?", (user_id,)
+        )
+        await db.commit()
+        removed = cursor.rowcount > 0
+    if removed:
+        logger.info("Deleted wallet for user %d", user_id)
+    return removed
+
+
+async def migrate_legacy_positions(admin_user_id: int):
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute(
+            "UPDATE open_positions SET user_id = ? WHERE user_id = 0",
+            (admin_user_id,),
+        )
+        await db.execute(
+            "UPDATE completed_trades SET user_id = ? WHERE user_id = 0",
+            (admin_user_id,),
+        )
+        await db.commit()
+    logger.info("Migrated legacy positions/trades to admin user %d", admin_user_id)
+
+
+async def upsert_bot_chat(chat_id: int, chat_type: str = "private", title: str = ""):
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO bot_chats (chat_id, chat_type, title) VALUES (?, ?, ?)",
+            (chat_id, chat_type, title),
+        )
+        await db.commit()
+
+
+async def remove_bot_chat(chat_id: int):
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute("DELETE FROM bot_chats WHERE chat_id = ?", (chat_id,))
+        await db.commit()
+    logger.info("Removed bot chat %d", chat_id)
+
+
+async def get_all_bot_chats() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM bot_chats ORDER BY added_at")
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]

@@ -1,5 +1,6 @@
 from telegram import Bot
 from telegram.constants import ParseMode
+from telegram.error import Forbidden, BadRequest
 
 from config import EXPLORER_TX, logger
 from scorer import format_score_bar
@@ -12,20 +13,44 @@ class Notifier:
         self.bot = Bot(token=bot_token)
         self.chat_id = chat_id
 
-    async def send_message(self, text: str):
+    async def send_message(self, text: str, chat_id: int | None = None):
+        target = chat_id if chat_id is not None else self.chat_id
         try:
             chunks = _split_message(text)
             for chunk in chunks:
                 await self.bot.send_message(
-                    chat_id=self.chat_id,
+                    chat_id=target,
                     text=chunk,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
         except Exception as exc:
-            logger.error("Failed to send Telegram message: %s", exc)
+            logger.error("Failed to send Telegram message to %s: %s", target, exc)
 
-    async def notify_new_token(self, token: dict, buy_amount: float, native_symbol: str):
+    async def send_to_user(self, user_id: int, text: str):
+        await self.send_message(text, chat_id=user_id)
+
+    async def broadcast_alert(self, text: str):
+        import db as _db
+        chats = await _db.get_all_bot_chats()
+        for chat in chats:
+            cid = chat["chat_id"]
+            try:
+                chunks = _split_message(text)
+                for chunk in chunks:
+                    await self.bot.send_message(
+                        chat_id=cid,
+                        text=chunk,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+            except (Forbidden, BadRequest) as exc:
+                logger.warning("Removing unreachable chat %d: %s", cid, exc)
+                await _db.remove_bot_chat(cid)
+            except Exception as exc:
+                logger.error("Failed to broadcast to chat %d: %s", cid, exc)
+
+    async def notify_new_token(self, token: dict, buy_amount: float, native_symbol: str, chat_id: int | None = None):
         mcap = _fmt_usd(token.get("market_cap", 0))
         liquidity = _fmt_usd(token.get("liquidity", 0))
         price = _fmt_price(token.get("price_usd", 0))
@@ -65,10 +90,11 @@ class Notifier:
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⚙️ Action: Buying with {buy_amount:.4f} {native_symbol}"
         )
-        await self.send_message(msg)
+        await self.send_message(msg, chat_id=chat_id)
 
     async def notify_buy_executed(
-        self, symbol: str, tokens_received: float, entry_price: float, tx_hash: str, chain: str
+        self, symbol: str, tokens_received: float, entry_price: float, tx_hash: str, chain: str,
+        chat_id: int | None = None,
     ):
         link = _tx_link(tx_hash, chain)
         msg = (
@@ -77,7 +103,7 @@ class Notifier:
             f"Entry Price: {_fmt_price(entry_price)}\n"
             f"TX: {link}"
         )
-        await self.send_message(msg)
+        await self.send_message(msg, chat_id=chat_id)
 
     async def notify_take_profit(
         self,
@@ -89,6 +115,7 @@ class Notifier:
         duration: str,
         tx_hash: str,
         chain: str,
+        chat_id: int | None = None,
     ):
         link = _tx_link(tx_hash, chain)
         msg = (
@@ -99,7 +126,7 @@ class Notifier:
             f"Duration: {duration}\n"
             f"TX: {link}"
         )
-        await self.send_message(msg)
+        await self.send_message(msg, chat_id=chat_id)
 
     async def notify_stop_loss(
         self,
@@ -111,6 +138,7 @@ class Notifier:
         duration: str,
         tx_hash: str,
         chain: str,
+        chat_id: int | None = None,
     ):
         link = _tx_link(tx_hash, chain)
         native = {"SOL": "SOL", "ETH": "ETH", "BSC": "BNB"}.get(chain.upper(), "SOL")
@@ -122,7 +150,7 @@ class Notifier:
             f"Duration: {duration}\n"
             f"TX: {link}"
         )
-        await self.send_message(msg)
+        await self.send_message(msg, chat_id=chat_id)
 
     async def notify_rug_pull(
         self,
@@ -135,8 +163,8 @@ class Notifier:
         tx_hash: str,
         chain: str,
         reason: str,
+        chat_id: int | None = None,
     ):
-        """Send rug pull emergency sell notification."""
         link = _tx_link(tx_hash, chain)
         native = {"SOL": "SOL", "ETH": "ETH", "BSC": "BNB"}.get(chain.upper(), "SOL")
         msg = (
@@ -152,11 +180,11 @@ class Notifier:
             f"TX: {link}\n"
             "━━━━━━━━━━━━━━━━━━━━━━"
         )
-        await self.send_message(msg)
+        await self.send_message(msg, chat_id=chat_id)
 
-    async def notify_error(self, error_msg: str):
+    async def notify_error(self, error_msg: str, chat_id: int | None = None):
         msg = f"⚠️ <b>ERROR</b>\n<code>{_esc(error_msg)}</code>"
-        await self.send_message(msg)
+        await self.send_message(msg, chat_id=chat_id)
 
     async def notify_whale_alert(
         self,
@@ -251,7 +279,6 @@ def _fmt_tokens(val) -> str:
 
 
 def _fmt_socials(social_links: dict) -> str:
-    """Format social links for Telegram message. Returns empty string if none."""
     if not social_links or not isinstance(social_links, dict):
         return ""
     icons = {
