@@ -146,9 +146,18 @@ def score_token(token: dict) -> dict:
 
     # --- 8. Token Age (5 pts) ---
     # Very new (< 1h) = 1 (risky), 1-6h = 3, 6-12h = 5, 12-24h = 4
-    # We don't have exact age in the token dict, so give 3 (neutral) as default.
-    # If the scanner already filtered to <24h, we know it's relatively new.
-    age_score = 3  # default neutral
+    age_hours = token.get("age_hours")
+    if age_hours is not None:
+        if age_hours < 1:
+            age_score = 1
+        elif age_hours < 6:
+            age_score = 3
+        elif age_hours < 12:
+            age_score = 5
+        else:
+            age_score = 4
+    else:
+        age_score = 3
     breakdown["age"] = age_score
 
     # --- 9. Price Momentum (5 pts) ---

@@ -237,6 +237,7 @@ async def _enrich_token(session: aiohttp.ClientSession, chain_id: str, address: 
     holders = _safe_int(details.get("holders"))
 
     creation_time = details.get("creationTime") or details.get("createdAt")
+    age_hours = None
     if creation_time:
         try:
             if isinstance(creation_time, str):
@@ -290,6 +291,7 @@ async def _enrich_token(session: aiohttp.ClientSession, chain_id: str, address: 
         "price_native": price_native,
         "volume_24h": volume_24h,
         "price_change_24h": variation_24h,
+        "age_hours": age_hours,
         "holders": holders,
         "buy_tax": buy_tax,
         "sell_tax": sell_tax,

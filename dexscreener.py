@@ -123,6 +123,7 @@ async def _enrich_from_dexscreener(
     total_txns = _safe_int(txns_24h.get("buys")) + _safe_int(txns_24h.get("sells"))
 
     created_at = best_pair.get("pairCreatedAt")
+    age_hours = None
     if created_at:
         try:
             ct = datetime.fromtimestamp(created_at / 1000, tz=timezone.utc)
@@ -186,6 +187,7 @@ async def _enrich_from_dexscreener(
         "price_native": price_native,
         "volume_24h": volume_24h,
         "price_change_24h": price_change_24h,
+        "age_hours": age_hours,
         "holders": 0,
         "buy_tax": hp_result["buy_tax"] if hp_result["checked"] else 0.0,
         "sell_tax": hp_result["sell_tax"] if hp_result["checked"] else 0.0,
