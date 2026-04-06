@@ -443,48 +443,67 @@ async def cmd_sell(update, context):
         logger.error("Manual sell failed for %s", token_address)
         return
 
-    if sell_percent == 100:
-        positions = await db.get_open_positions()
-        for pos in positions:
-            if pos["token_address"].lower() == token_address.lower() and pos["chain"] == CHAIN.upper():
-                entry_price = pos["entry_price"]
-                roi = ((result["exit_price"] - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+    pnl_native = None
+    roi = None
+    matched_pos = None
+    positions = await db.get_open_positions()
+    for pos in positions:
+        if pos["token_address"].lower() == token_address.lower() and pos["chain"] == CHAIN.upper():
+            matched_pos = pos
+            break
 
-                opened_at = pos.get("opened_at", "")
-                duration_seconds = 0
-                if opened_at:
-                    try:
-                        if isinstance(opened_at, str):
-                            ot = datetime.fromisoformat(opened_at).replace(tzinfo=timezone.utc)
-                        else:
-                            ot = opened_at
-                        duration_seconds = int((datetime.now(timezone.utc) - ot).total_seconds())
-                    except Exception:
-                        pass
+    if matched_pos:
+        entry_price = matched_pos["entry_price"]
+        buy_cost = matched_pos["buy_amount_native"]
+        roi = ((result["exit_price"] - entry_price) / entry_price) * 100 if entry_price > 0 else 0
 
-                exit_data = {
-                    "exit_price": result["exit_price"],
-                    "sell_amount_native": result["native_received"],
-                    "profit_usd": None,
-                    "roi_percent": roi,
-                    "sell_tx_hash": result["tx_hash"],
-                    "duration_seconds": duration_seconds,
-                }
-                await db.close_position(pos["token_address"], CHAIN.upper(), exit_data)
-                break
+        if sell_percent == 100:
+            pnl_native = result["native_received"] - buy_cost
+
+            opened_at = matched_pos.get("opened_at", "")
+            duration_seconds = 0
+            if opened_at:
+                try:
+                    if isinstance(opened_at, str):
+                        ot = datetime.fromisoformat(opened_at).replace(tzinfo=timezone.utc)
+                    else:
+                        ot = opened_at
+                    duration_seconds = int((datetime.now(timezone.utc) - ot).total_seconds())
+                except Exception:
+                    pass
+
+            exit_data = {
+                "exit_price": result["exit_price"],
+                "sell_amount_native": result["native_received"],
+                "profit_usd": None,
+                "roi_percent": roi,
+                "sell_tx_hash": result["tx_hash"],
+                "duration_seconds": duration_seconds,
+            }
+            await db.close_position(matched_pos["token_address"], CHAIN.upper(), exit_data)
+        else:
+            pnl_native = result["native_received"] - (buy_cost * sell_percent / 100)
 
     tx_url = EXPLORER_TX.get(CHAIN.upper(), EXPLORER_TX["SOL"]).format(result["tx_hash"])
     short_hash = result["tx_hash"][:10] + "\u2026" + result["tx_hash"][-6:] if len(result["tx_hash"]) > 20 else result["tx_hash"]
+
+    pnl_line = ""
+    if pnl_native is not None and roi is not None:
+        pnl_sign = "+" if pnl_native >= 0 else ""
+        roi_sign = "+" if roi >= 0 else ""
+        pnl_emoji = "\U0001f7e2" if pnl_native >= 0 else "\U0001f534"
+        pnl_line = f"\n{pnl_emoji} PNL: {pnl_sign}{pnl_native:.6f} {native} ({roi_sign}{roi:.2f}%)"
 
     await update.message.reply_html(
         f"\u2705 <b>Sell Executed</b>\n"
         f"Token: <code>{token_address[:16]}...</code>\n"
         f"Sold: {sell_percent}% ({sell_ui:.4f} tokens)\n"
-        f"Received: {result['native_received']:.6f} {native}\n"
+        f"Received: {result['native_received']:.6f} {native}"
+        f"{pnl_line}\n"
         f'TX: <a href="{tx_url}">{short_hash}</a>'
     )
 
-    logger.info("Manual sell executed: %s (%d%%), tx=%s", token_address, sell_percent, result["tx_hash"])
+    logger.info("Manual sell executed: %s (%d%%), pnl=%s, tx=%s", token_address, sell_percent, pnl_native, result["tx_hash"])
 
 
 async def cmd_adduser(update, context):
