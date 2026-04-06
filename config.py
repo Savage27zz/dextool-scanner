@@ -46,6 +46,7 @@ SCAN_INTERVAL: int = _env("SCAN_INTERVAL", default="60", cast=int)
 MONITOR_INTERVAL: int = _env("MONITOR_INTERVAL", default="30", cast=int)
 
 MIN_SCORE: int = _env("MIN_SCORE", default="40", cast=int)
+MAX_POSITIONS: int = _env("MAX_POSITIONS", default="5", cast=int)
 
 DEXTOOLS_BASE_URL = f"https://public-api.dextools.io/{DEXTOOLS_PLAN}/v2"
 

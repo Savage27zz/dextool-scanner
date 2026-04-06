@@ -12,6 +12,7 @@ from config import (
     CHAIN,
     EXPLORER_TX,
     MAX_MCAP,
+    MAX_POSITIONS,
     MIN_LIQUIDITY,
     MIN_MCAP,
     MIN_SCORE,
@@ -77,6 +78,14 @@ async def scanner_loop():
                 for token in tokens:
                     try:
                         await db.save_detected_token(token)
+
+                        open_positions = await db.get_open_positions()
+                        if len(open_positions) >= MAX_POSITIONS:
+                            logger.warning(
+                                "Max positions (%d) reached — skipping %s",
+                                MAX_POSITIONS, token["symbol"],
+                            )
+                            break
 
                         if CHAIN.upper() == "SOL":
                             buy_amount = await trader.get_buy_amount()
@@ -188,6 +197,7 @@ async def cmd_start(update, context):
         f"Chain: {CHAIN}\n"
         f"Wallet balance: {balance:.4f} {native}\n"
         f"Buy: {BUY_PERCENT}% | TP: {TAKE_PROFIT}% | SL: {STOP_LOSS}% | Slippage: {SLIPPAGE}%\n"
+        f"Max Positions: {MAX_POSITIONS}\n"
         f"Scan every {SCAN_INTERVAL}s | Monitor every {MONITOR_INTERVAL}s\n"
         f"MCap: ${MIN_MCAP:,}–${MAX_MCAP:,} | Min Liq: ${MIN_LIQUIDITY:,}\n"
         f"Manual: /buy &lt;address&gt; [amount] | /sell &lt;address&gt; [percent]"
@@ -299,6 +309,7 @@ async def cmd_config(update, context):
         f"Min Liquidity: ${MIN_LIQUIDITY:,}\n"
         f"Market Cap Range: ${MIN_MCAP:,} – ${MAX_MCAP:,}\n"
         f"Min Safety Score: {MIN_SCORE}/100\n"
+        f"Max Positions: {MAX_POSITIONS}\n"
         f"Scan Interval: {SCAN_INTERVAL}s\n"
         f"Monitor Interval: {MONITOR_INTERVAL}s"
     )

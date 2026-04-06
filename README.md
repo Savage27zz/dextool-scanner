@@ -61,6 +61,7 @@ Edit `.env` with your values:
 | `SCAN_INTERVAL` | Seconds between DexTools scans | `60` |
 | `MONITOR_INTERVAL` | Seconds between position checks | `30` |
 | `MIN_SCORE` | Minimum safety score (0-100) for auto-buy | `40` |
+| `MAX_POSITIONS` | Maximum number of open positions at once | `5` |
 
 ## Usage
 
