@@ -23,6 +23,8 @@ from config import (
     TAKE_PROFIT,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
+    TRAILING_DROP,
+    TRAILING_ENABLED,
     logger,
 )
 from monitor import ProfitMonitor, _format_duration
@@ -243,6 +245,8 @@ async def cmd_status(update, context):
             f"   Current: {p.get('current_price', 0):.10f} {native}\n"
             f"   Amount: {p['tokens_received']:.4f} | Spent: {p['buy_amount_native']:.4f} {native}\n"
         )
+        if p.get("trailing_activated"):
+            lines.append(f"   📈 Trailing active | Peak: {p.get('peak_price', 0):.10f} {native}")
 
     await update.message.reply_html("\n".join(lines))
 
@@ -295,6 +299,8 @@ async def cmd_config(update, context):
         f"Buy Percent: {BUY_PERCENT}%\n"
         f"Take Profit: {TAKE_PROFIT}%\n"
         f"Stop Loss: {STOP_LOSS}%\n"
+        f"Trailing TP: {'Enabled' if TRAILING_ENABLED else 'Disabled'}\n"
+        f"Trailing Drop: {TRAILING_DROP}%\n"
         f"Slippage: {SLIPPAGE}%\n"
         f"Min Liquidity: ${MIN_LIQUIDITY:,}\n"
         f"Market Cap Range: ${MIN_MCAP:,} – ${MAX_MCAP:,}\n"

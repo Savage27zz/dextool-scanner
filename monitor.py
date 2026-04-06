@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import aiohttp
 
 import db
-from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, STOP_LOSS, TAKE_PROFIT, logger
+from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, STOP_LOSS, TAKE_PROFIT, TRAILING_DROP, TRAILING_ENABLED, logger
 
 
 class ProfitMonitor:
@@ -104,25 +104,77 @@ class ProfitMonitor:
                 roi = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                 logger.debug("%s ROI: %.2f%% (entry=%.10f, current=%.10f)", symbol, roi, entry_price, current_price)
 
-                if roi >= TAKE_PROFIT:
-                    logger.info("TP hit for %s – ROI %.2f%% >= %d%%", symbol, roi, TAKE_PROFIT)
-                    sell_result = await self._execute_sell_and_close(pos, roi, "Take-profit")
-                    if sell_result:
+                sold = False
+
+                if TRAILING_ENABLED:
+                    trailing_activated = bool(pos.get("trailing_activated", 0))
+                    peak_price = pos.get("peak_price", 0) or 0
+
+                    if roi >= TAKE_PROFIT and not trailing_activated:
+                        trailing_activated = True
+                        peak_price = current_price
+                        await db.update_peak_price(token_address, chain, peak_price, True)
+                        logger.info(
+                            "Trailing activated for %s – ROI %.2f%%, peak=%.10f",
+                            symbol, roi, peak_price,
+                        )
                         native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
-                        duration_str = _format_duration(sell_result["duration_seconds"])
-                        profit_native = sell_result["native_received"] - pos["buy_amount_native"]
-                        await self.notifier.notify_take_profit(
-                            symbol=symbol,
-                            entry_price=entry_price,
-                            exit_price=sell_result["exit_price"],
-                            roi=round(roi, 2),
-                            profit_usd=profit_native,
-                            duration=duration_str,
-                            tx_hash=sell_result["tx_hash"],
-                            chain=chain,
+                        await self.notifier.send_message(
+                            f"📈 <b>Trailing TP activated</b> for {symbol}\n"
+                            f"ROI: {roi:+.2f}% | Peak: {peak_price:.10f} {native}\n"
+                            f"Will sell on {TRAILING_DROP}% drop from peak."
                         )
 
-                elif STOP_LOSS < 0 and roi <= STOP_LOSS:
+                    elif trailing_activated:
+                        if current_price > peak_price:
+                            peak_price = current_price
+                            await db.update_peak_price(token_address, chain, peak_price, True)
+                            logger.debug("New peak for %s: %.10f", symbol, peak_price)
+                        else:
+                            drop_from_peak = ((peak_price - current_price) / peak_price) * 100 if peak_price > 0 else 0
+                            if drop_from_peak >= TRAILING_DROP:
+                                logger.info(
+                                    "Trailing sell for %s – dropped %.2f%% from peak %.10f",
+                                    symbol, drop_from_peak, peak_price,
+                                )
+                                sell_result = await self._execute_sell_and_close(pos, roi, "Trailing-TP")
+                                if sell_result:
+                                    sold = True
+                                    native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
+                                    duration_str = _format_duration(sell_result["duration_seconds"])
+                                    profit_native = sell_result["native_received"] - pos["buy_amount_native"]
+                                    await self.notifier.notify_take_profit(
+                                        symbol=symbol,
+                                        entry_price=entry_price,
+                                        exit_price=sell_result["exit_price"],
+                                        roi=round(roi, 2),
+                                        profit_usd=profit_native,
+                                        duration=duration_str,
+                                        tx_hash=sell_result["tx_hash"],
+                                        chain=chain,
+                                    )
+
+                else:
+                    if roi >= TAKE_PROFIT:
+                        logger.info("TP hit for %s – ROI %.2f%% >= %d%%", symbol, roi, TAKE_PROFIT)
+                        sell_result = await self._execute_sell_and_close(pos, roi, "Take-profit")
+                        if sell_result:
+                            sold = True
+                            native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
+                            duration_str = _format_duration(sell_result["duration_seconds"])
+                            profit_native = sell_result["native_received"] - pos["buy_amount_native"]
+                            await self.notifier.notify_take_profit(
+                                symbol=symbol,
+                                entry_price=entry_price,
+                                exit_price=sell_result["exit_price"],
+                                roi=round(roi, 2),
+                                profit_usd=profit_native,
+                                duration=duration_str,
+                                tx_hash=sell_result["tx_hash"],
+                                chain=chain,
+                            )
+
+                if not sold and STOP_LOSS < 0 and roi <= STOP_LOSS:
                     logger.info("SL hit for %s – ROI %.2f%% <= %d%%", symbol, roi, STOP_LOSS)
                     sell_result = await self._execute_sell_and_close(pos, roi, "Stop-loss")
                     if sell_result:

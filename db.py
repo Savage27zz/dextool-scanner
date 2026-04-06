@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS open_positions (
     buy_amount_native REAL NOT NULL,
     buy_tx_hash TEXT NOT NULL,
     pair_address TEXT,
+    peak_price REAL DEFAULT 0,
+    trailing_activated INTEGER DEFAULT 0,
     opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(token_address, chain)
 );
@@ -93,6 +95,15 @@ async def init_db():
         await db.execute(_CREATE_OPEN_POSITIONS)
         await db.execute(_CREATE_COMPLETED_TRADES)
         await db.execute(_CREATE_ALLOWED_USERS)
+        # Migration: add trailing columns if they don't exist
+        try:
+            await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
+        except Exception:
+            pass  # column already exists
+        try:
+            await db.execute("ALTER TABLE open_positions ADD COLUMN trailing_activated INTEGER DEFAULT 0")
+        except Exception:
+            pass  # column already exists
         await db.commit()
     logger.info("Database initialised at %s", DB_PATH)
 
@@ -261,6 +272,18 @@ async def is_user_allowed(user_id: int) -> bool:
             "SELECT 1 FROM allowed_users WHERE user_id = ? LIMIT 1", (user_id,)
         )
         return await cursor.fetchone() is not None
+
+
+async def update_peak_price(token_address: str, chain: str, peak_price: float, trailing_activated: bool):
+    """Update the peak price and trailing activation status for an open position."""
+    sql = """
+        UPDATE open_positions 
+        SET peak_price = ?, trailing_activated = ?
+        WHERE token_address = ? AND chain = ?
+    """
+    async with aiosqlite.connect(str(DB_PATH)) as db_conn:
+        await db_conn.execute(sql, (peak_price, int(trailing_activated), token_address, chain))
+        await db_conn.commit()
 
 
 async def is_token_already_bought(contract_address: str, chain: str) -> bool:

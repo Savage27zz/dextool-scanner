@@ -36,6 +36,8 @@ CHAIN: str = _env("CHAIN", default="SOL")
 BUY_PERCENT: int = _env("BUY_PERCENT", default="50", cast=int)
 TAKE_PROFIT: int = _env("TAKE_PROFIT", default="20", cast=int)
 STOP_LOSS: int = _env("STOP_LOSS", default="-30", cast=int)
+TRAILING_ENABLED: bool = _env("TRAILING_ENABLED", default="true", cast=lambda v: v.lower() in ("true", "1", "yes"))
+TRAILING_DROP: int = _env("TRAILING_DROP", default="10", cast=int)
 SLIPPAGE: int = _env("SLIPPAGE", default="15", cast=int)
 
 MIN_LIQUIDITY: int = _env("MIN_LIQUIDITY", default="5000", cast=int)
