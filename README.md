@@ -55,6 +55,7 @@ Edit `.env` with your values:
 | `TAKE_PROFIT` | ROI % target to trigger sell | `20` |
 | `STOP_LOSS` | ROI % floor to trigger stop-loss sell (negative) | `-50` |
 | `TRAILING_STOP` | % drop from peak to trigger trailing stop (0 = disabled) | `0` |
+| `SELL_PERCENT` | % of position to sell on TP/trailing (100 = full, <100 = partial) | `100` |
 | `SLIPPAGE` | Slippage tolerance % | `15` |
 | `MIN_LIQUIDITY` | Minimum pool liquidity in USD | `5000` |
 | `MIN_MCAP` | Minimum market cap in USD | `10000` |
@@ -63,6 +64,7 @@ Edit `.env` with your values:
 | `MONITOR_INTERVAL` | Seconds between position checks | `30` |
 | `MIN_SCORE` | Minimum safety score (0-100) for auto-buy | `40` |
 | `MAX_POSITIONS` | Maximum number of open positions at once | `5` |
+| `DRY_RUN` | Paper trading mode — log trades without executing (`true`/`false`) | `false` |
 
 ## Usage
 

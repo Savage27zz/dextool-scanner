@@ -279,6 +279,77 @@ async def update_peak_price(token_address: str, chain: str, peak_price: float):
         await conn.commit()
 
 
+async def get_open_position(token_address: str, chain: str) -> dict | None:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM open_positions WHERE token_address = ? AND chain = ? LIMIT 1",
+            (token_address, chain),
+        )
+        row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def update_position_dca(
+    token_address: str,
+    chain: str,
+    additional_tokens: float,
+    additional_native: float,
+    new_tx_hash: str,
+):
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM open_positions WHERE token_address = ? AND chain = ?",
+            (token_address, chain),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return
+        pos = dict(row)
+        new_tokens = pos["tokens_received"] + additional_tokens
+        new_native = pos["buy_amount_native"] + additional_native
+        new_entry = new_native / new_tokens if new_tokens > 0 else pos["entry_price"]
+        await conn.execute(
+            "UPDATE open_positions SET tokens_received = ?, buy_amount_native = ?, "
+            "entry_price = ?, buy_tx_hash = ?, peak_price = ? "
+            "WHERE token_address = ? AND chain = ?",
+            (new_tokens, new_native, new_entry, new_tx_hash,
+             max(pos.get("peak_price", 0) or 0, new_entry), token_address, chain),
+        )
+        await conn.commit()
+    logger.info(
+        "DCA update %s on %s: +%.4f tokens, +%.4f native, new entry=%.10f",
+        token_address, chain, additional_tokens, additional_native, new_entry,
+    )
+
+
+async def reduce_position(token_address: str, chain: str, fraction_sold: float):
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM open_positions WHERE token_address = ? AND chain = ?",
+            (token_address, chain),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return
+        pos = dict(row)
+        remaining = 1.0 - fraction_sold
+        new_tokens = pos["tokens_received"] * remaining
+        new_native = pos["buy_amount_native"] * remaining
+        await conn.execute(
+            "UPDATE open_positions SET tokens_received = ?, buy_amount_native = ? "
+            "WHERE token_address = ? AND chain = ?",
+            (new_tokens, new_native, token_address, chain),
+        )
+        await conn.commit()
+    logger.info(
+        "Reduced position %s on %s by %.0f%% — %.4f tokens remaining",
+        token_address, chain, fraction_sold * 100, new_tokens,
+    )
+
+
 async def is_token_already_bought(contract_address: str, chain: str) -> bool:
     async with aiosqlite.connect(str(DB_PATH)) as db:
         cur1 = await db.execute(

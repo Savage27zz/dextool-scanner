@@ -10,6 +10,7 @@ import db
 from config import (
     BUY_PERCENT,
     CHAIN,
+    DRY_RUN,
     EXPLORER_TX,
     MAX_MCAP,
     MAX_POSITIONS,
@@ -19,6 +20,7 @@ from config import (
     MONITOR_INTERVAL,
     NATIVE_SYMBOL,
     SCAN_INTERVAL,
+    SELL_PERCENT,
     SLIPPAGE,
     STOP_LOSS,
     TAKE_PROFIT,
@@ -57,7 +59,7 @@ async def _reject_unauthorized(update) -> bool:
     uid = update.effective_user.id
     uname = update.effective_user.username or update.effective_user.first_name or ""
     await update.message.reply_html(
-        f"🔒 <b>Access Denied</b>\n\n"
+        f"\U0001f512 <b>Access Denied</b>\n\n"
         f"Your user ID: <code>{uid}</code>\n"
         f"Ask the bot admin to run:\n"
         f"<code>/adduser {uid}</code>"
@@ -69,7 +71,8 @@ async def _reject_unauthorized(update) -> bool:
 async def scanner_loop():
     global is_running
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    logger.info("Scanner loop started (chain=%s, interval=%ds)", CHAIN, SCAN_INTERVAL)
+    logger.info("Scanner loop started (chain=%s, interval=%ds%s)", CHAIN, SCAN_INTERVAL,
+                ", DRY_RUN" if DRY_RUN else "")
 
     while is_running:
         try:
@@ -83,7 +86,7 @@ async def scanner_loop():
                         open_positions = await db.get_open_positions()
                         if len(open_positions) >= MAX_POSITIONS:
                             logger.warning(
-                                "Max positions (%d) reached — skipping %s",
+                                "Max positions (%d) reached \u2014 skipping %s",
                                 MAX_POSITIONS, token["symbol"],
                             )
                             break
@@ -98,6 +101,10 @@ async def scanner_loop():
                             continue
 
                         await notifier.notify_new_token(token, buy_amount, native)
+
+                        if DRY_RUN:
+                            logger.info("[DRY_RUN] Would buy %s for %.4f %s", token["symbol"], buy_amount, native)
+                            continue
 
                         if CHAIN.upper() == "SOL":
                             result = await trader.buy_token(token["contract_address"], buy_amount)
@@ -143,27 +150,27 @@ async def cmd_help(update, context):
     is_auth = await _is_authorized(update)
 
     lines = [
-        "🤖 <b>DexTool Scanner Bot</b>\n",
+        "\U0001f916 <b>DexTool Scanner Bot</b>\n",
         "Scans DexTools for new low-cap tokens on Solana, auto-buys qualifying tokens, and takes profit automatically.\n",
     ]
 
     if is_auth:
         lines.append("<b>Commands:</b>")
-        lines.append("/help — Show this message")
-        lines.append("/status — Open positions with live ROI")
-        lines.append("/balance — Wallet balance")
-        lines.append("/history — Last 10 completed trades")
-        lines.append("/config — Current bot configuration")
-        lines.append("/buy &lt;address&gt; [amount] — Manual buy")
-        lines.append("/sell &lt;address&gt; [percent] — Manual sell")
-        lines.append("/portfolio — Full portfolio overview with PnL")
+        lines.append("/help \u2014 Show this message")
+        lines.append("/status \u2014 Open positions with live ROI")
+        lines.append("/balance \u2014 Wallet balance")
+        lines.append("/history \u2014 Last 10 completed trades")
+        lines.append("/config \u2014 Current bot configuration")
+        lines.append("/buy &lt;address&gt; [amount] \u2014 Manual buy (DCA if already held)")
+        lines.append("/sell &lt;address&gt; [percent] \u2014 Manual sell")
+        lines.append("/portfolio \u2014 Full portfolio overview with PnL")
         if is_admin:
             lines.append("\n<b>Admin only:</b>")
-            lines.append("/start — Start scanning and trading")
-            lines.append("/stop — Pause scanning and trading")
-            lines.append("/adduser &lt;user_id&gt; — Grant access")
-            lines.append("/removeuser &lt;user_id&gt; — Revoke access")
-            lines.append("/users — List authorized users")
+            lines.append("/start \u2014 Start scanning and trading")
+            lines.append("/stop \u2014 Pause scanning and trading")
+            lines.append("/adduser &lt;user_id&gt; \u2014 Grant access")
+            lines.append("/removeuser &lt;user_id&gt; \u2014 Revoke access")
+            lines.append("/users \u2014 List authorized users")
     else:
         uid = update.effective_user.id
         lines.append(f"Your user ID: <code>{uid}</code>")
@@ -193,15 +200,18 @@ async def cmd_start(update, context):
     else:
         balance = await trader.get_balance(CHAIN)
 
+    dry_tag = "\U0001f4dd <b>DRY RUN MODE</b> \u2014 no real trades\n\n" if DRY_RUN else ""
     msg = (
-        "🚀 <b>Bot Started</b>\n\n"
+        f"{dry_tag}"
+        "\U0001f680 <b>Bot Started</b>\n\n"
         f"Chain: {CHAIN}\n"
         f"Wallet balance: {balance:.4f} {native}\n"
         f"Buy: {BUY_PERCENT}% | TP: {TAKE_PROFIT}% | SL: {STOP_LOSS}% | Slippage: {SLIPPAGE}%\n"
         f"Trailing Stop: {TRAILING_STOP}%{'  (disabled)' if TRAILING_STOP == 0 else ''}\n"
+        f"Sell on TP: {SELL_PERCENT}%{'  (partial)' if SELL_PERCENT < 100 else ''}\n"
         f"Max Positions: {MAX_POSITIONS}\n"
         f"Scan every {SCAN_INTERVAL}s | Monitor every {MONITOR_INTERVAL}s\n"
-        f"MCap: ${MIN_MCAP:,}–${MAX_MCAP:,} | Min Liq: ${MIN_LIQUIDITY:,}\n"
+        f"MCap: ${MIN_MCAP:,}\u2013${MAX_MCAP:,} | Min Liq: ${MIN_LIQUIDITY:,}\n"
         f"Manual: /buy &lt;address&gt; [amount] | /sell &lt;address&gt; [percent]"
     )
     await update.message.reply_html(msg)
@@ -230,7 +240,7 @@ async def cmd_stop(update, context):
     scanner_task = None
     monitor_task = None
 
-    await update.message.reply_html("🛑 <b>Bot Stopped</b>\nScanning and trading paused. Bot still responds to commands.")
+    await update.message.reply_html("\U0001f6d1 <b>Bot Stopped</b>\nScanning and trading paused. Bot still responds to commands.")
     logger.info("Bot stopped by user %s", update.effective_user.id)
 
 
@@ -245,12 +255,26 @@ async def cmd_status(update, context):
         return
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    lines = ["📊 <b>Open Positions</b>\n"]
+    lines = ["\U0001f4ca <b>Open Positions</b>\n"]
+    now = datetime.now(timezone.utc)
     for p in positions:
         roi = p.get("roi", 0)
-        arrow = "🟢" if roi >= 0 else "🔴"
+        arrow = "\U0001f7e2" if roi >= 0 else "\U0001f534"
+
+        age_str = ""
+        opened_at = p.get("opened_at", "")
+        if opened_at:
+            try:
+                if isinstance(opened_at, str):
+                    ot = datetime.fromisoformat(opened_at).replace(tzinfo=timezone.utc)
+                else:
+                    ot = opened_at
+                age_str = f" | Held: {_format_duration(int((now - ot).total_seconds()))}"
+            except Exception as exc:
+                logger.debug("Age parse error for %s: %s", p["token_symbol"], exc)
+
         lines.append(
-            f"{arrow} <b>{p['token_symbol']}</b> | ROI: {roi:+.2f}%\n"
+            f"{arrow} <b>{p['token_symbol']}</b> | ROI: {roi:+.2f}%{age_str}\n"
             f"   Entry: {p['entry_price']:.10f} {native}\n"
             f"   Current: {p.get('current_price', 0):.10f} {native}\n"
             f"   Amount: {p['tokens_received']:.4f} | Spent: {p['buy_amount_native']:.4f} {native}\n"
@@ -269,7 +293,7 @@ async def cmd_balance(update, context):
     else:
         balance = await trader.get_balance(CHAIN)
 
-    await update.message.reply_html(f"💰 <b>Wallet Balance</b>\n{balance:.6f} {native} ({CHAIN})")
+    await update.message.reply_html(f"\U0001f4b0 <b>Wallet Balance</b>\n{balance:.6f} {native} ({CHAIN})")
 
 
 async def cmd_history(update, context):
@@ -283,14 +307,14 @@ async def cmd_history(update, context):
         return
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    lines = ["📜 <b>Trade History</b> (last 10)\n"]
+    lines = ["\U0001f4dc <b>Trade History</b> (last 10)\n"]
     for t in trades:
         roi = t.get("roi_percent", 0)
-        arrow = "🟢" if roi >= 0 else "🔴"
+        arrow = "\U0001f7e2" if roi >= 0 else "\U0001f534"
         dur = _format_duration(t.get("duration_seconds", 0))
         lines.append(
             f"{arrow} <b>{t['token_symbol']}</b> | ROI: {roi:+.2f}%\n"
-            f"   Buy: {t['buy_amount_native']:.4f} → Sell: {t['sell_amount_native']:.4f} {native}\n"
+            f"   Buy: {t['buy_amount_native']:.4f} \u2192 Sell: {t['sell_amount_native']:.4f} {native}\n"
             f"   Duration: {dur}\n"
         )
 
@@ -302,15 +326,17 @@ async def cmd_config(update, context):
         return
 
     msg = (
-        "⚙️ <b>Configuration</b>\n\n"
+        "\u2699\ufe0f <b>Configuration</b>\n\n"
         f"Chain: {CHAIN}\n"
+        f"Dry Run: {'Yes' if DRY_RUN else 'No'}\n"
         f"Buy Percent: {BUY_PERCENT}%\n"
         f"Take Profit: {TAKE_PROFIT}%\n"
         f"Stop Loss: {STOP_LOSS}%\n"
         f"Trailing Stop: {TRAILING_STOP}%{'  (disabled)' if TRAILING_STOP == 0 else ''}\n"
+        f"Sell on TP: {SELL_PERCENT}%{'  (partial)' if SELL_PERCENT < 100 else ''}\n"
         f"Slippage: {SLIPPAGE}%\n"
         f"Min Liquidity: ${MIN_LIQUIDITY:,}\n"
-        f"Market Cap Range: ${MIN_MCAP:,} – ${MAX_MCAP:,}\n"
+        f"Market Cap Range: ${MIN_MCAP:,} \u2013 ${MAX_MCAP:,}\n"
         f"Min Safety Score: {MIN_SCORE}/100\n"
         f"Max Positions: {MAX_POSITIONS}\n"
         f"Scan Interval: {SCAN_INTERVAL}s\n"
@@ -328,7 +354,8 @@ async def cmd_buy(update, context):
         await update.message.reply_html(
             "Usage: <code>/buy &lt;token_address&gt; [amount]</code>\n"
             "Example: <code>/buy So1abc...xyz 0.5</code>\n"
-            "If amount is omitted, uses configured BUY_PERCENT% of balance."
+            "If amount is omitted, uses configured BUY_PERCENT% of balance.\n"
+            "If already held, averages into the position (DCA)."
         )
         return
 
@@ -354,10 +381,8 @@ async def cmd_buy(update, context):
         await update.message.reply_text(f"Insufficient {native} balance.")
         return
 
-    already = await db.is_token_already_bought(token_address, CHAIN.upper())
-    if already:
-        await update.message.reply_text("Already holding a position in this token.")
-        return
+    existing = await db.get_open_position(token_address, CHAIN.upper())
+    is_dca = existing is not None
 
     async with aiohttp.ClientSession() as hp_session:
         hp = await check_honeypot(hp_session, CHAIN, token_address)
@@ -368,11 +393,22 @@ async def cmd_buy(update, context):
             f"Buy Tax: {hp['buy_tax']:.1f}% | Sell Tax: {hp['sell_tax']:.1f}%\n"
             "Buy cancelled for your safety."
         )
-        logger.warning("Manual buy blocked — honeypot: %s", token_address)
+        logger.warning("Manual buy blocked \u2014 honeypot: %s", token_address)
+        return
+
+    label = "DCA Buy" if is_dca else "Manual Buy"
+
+    if DRY_RUN:
+        await update.message.reply_html(
+            f"\U0001f4dd <b>[DRY RUN] {label}</b>\n"
+            f"Token: <code>{token_address}</code>\n"
+            f"Amount: {buy_amount:.4f} {native}\n"
+            "No trade executed (dry run mode)."
+        )
         return
 
     await update.message.reply_html(
-        f"\U0001f504 <b>Manual Buy</b>\n"
+        f"\U0001f504 <b>{label}</b>\n"
         f"Token: <code>{token_address}</code>\n"
         f"Amount: {buy_amount:.4f} {native}\n"
         f"Executing..."
@@ -388,28 +424,37 @@ async def cmd_buy(update, context):
         logger.error("Manual buy failed for %s", token_address)
         return
 
-    symbol = token_address[:8]
-    position = {
-        "token_address": token_address,
-        "token_symbol": result.get("symbol", symbol),
-        "chain": CHAIN.upper(),
-        "entry_price": result["entry_price"],
-        "tokens_received": result["tokens_received"],
-        "buy_amount_native": result["amount_spent"],
-        "buy_tx_hash": result["tx_hash"],
-        "pair_address": "",
-    }
-    await db.save_open_position(position)
+    symbol = result.get("symbol", token_address[:8])
+
+    if is_dca:
+        await db.update_position_dca(
+            token_address, CHAIN.upper(),
+            additional_tokens=result["tokens_received"],
+            additional_native=result["amount_spent"],
+            new_tx_hash=result["tx_hash"],
+        )
+    else:
+        position = {
+            "token_address": token_address,
+            "token_symbol": symbol,
+            "chain": CHAIN.upper(),
+            "entry_price": result["entry_price"],
+            "tokens_received": result["tokens_received"],
+            "buy_amount_native": result["amount_spent"],
+            "buy_tx_hash": result["tx_hash"],
+            "pair_address": "",
+        }
+        await db.save_open_position(position)
 
     await notifier.notify_buy_executed(
-        symbol=symbol,
+        symbol=f"{symbol} (DCA)" if is_dca else symbol,
         tokens_received=result["tokens_received"],
         entry_price=result["entry_price"],
         tx_hash=result["tx_hash"],
         chain=CHAIN.upper(),
     )
 
-    logger.info("Manual buy executed: %s, tx=%s", token_address, result["tx_hash"])
+    logger.info("%s executed: %s, tx=%s", label, token_address, result["tx_hash"])
 
 
 async def cmd_sell(update, context):
@@ -458,6 +503,15 @@ async def cmd_sell(update, context):
         await update.message.reply_text("Amount too small to sell.")
         return
 
+    if DRY_RUN:
+        await update.message.reply_html(
+            f"\U0001f4dd <b>[DRY RUN] Manual Sell</b>\n"
+            f"Token: <code>{token_address}</code>\n"
+            f"Would sell: {sell_percent}% ({sell_ui:.4f} tokens)\n"
+            "No trade executed (dry run mode)."
+        )
+        return
+
     await update.message.reply_html(
         f"\U0001f504 <b>Manual Sell</b>\n"
         f"Token: <code>{token_address}</code>\n"
@@ -491,8 +545,8 @@ async def cmd_sell(update, context):
                         else:
                             ot = opened_at
                         duration_seconds = int((datetime.now(timezone.utc) - ot).total_seconds())
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Duration parse error: %s", exc)
 
                 exit_data = {
                     "exit_price": result["exit_price"],
@@ -648,7 +702,7 @@ async def cmd_adduser(update, context):
 
     username = context.args[1] if len(context.args) > 1 else ""
     await db.add_allowed_user(user_id, username)
-    await update.message.reply_html(f"✅ User <code>{user_id}</code> has been granted access.")
+    await update.message.reply_html(f"\u2705 User <code>{user_id}</code> has been granted access.")
 
 
 async def cmd_removeuser(update, context):
@@ -668,7 +722,7 @@ async def cmd_removeuser(update, context):
 
     removed = await db.remove_allowed_user(user_id)
     if removed:
-        await update.message.reply_html(f"🚫 User <code>{user_id}</code> access revoked.")
+        await update.message.reply_html(f"\U0001f6ab User <code>{user_id}</code> access revoked.")
     else:
         await update.message.reply_html(f"User <code>{user_id}</code> was not in the list.")
 
@@ -683,10 +737,10 @@ async def cmd_users(update, context):
         await update.message.reply_text("No authorized users (besides admin).")
         return
 
-    lines = ["👥 <b>Authorized Users</b>\n"]
+    lines = ["\U0001f465 <b>Authorized Users</b>\n"]
     for u in users:
-        name = u.get("username") or "—"
-        lines.append(f"• <code>{u['user_id']}</code> ({name}) — added {u.get('added_at', '?')}")
+        name = u.get("username") or "\u2014"
+        lines.append(f"\u2022 <code>{u['user_id']}</code> ({name}) \u2014 added {u.get('added_at', '?')}")
 
     await update.message.reply_html("\n".join(lines))
 
@@ -706,9 +760,10 @@ async def post_init(application):
     else:
         balance = await trader.get_balance(CHAIN)
 
-    logger.info("Bot initialised – chain=%s, balance=%.6f %s", CHAIN, balance, native)
+    dry_tag = " [DRY RUN]" if DRY_RUN else ""
+    logger.info("Bot initialised \u2013 chain=%s, balance=%.6f %s%s", CHAIN, balance, native, dry_tag)
     await notifier.send_message(
-        f"🤖 <b>DexTool Scanner Online</b>\n"
+        f"\U0001f916 <b>DexTool Scanner Online{dry_tag}</b>\n"
         f"Chain: {CHAIN} | Balance: {balance:.4f} {native}\n"
         f"Send /start to begin scanning."
     )
@@ -725,7 +780,7 @@ async def shutdown(application):
 
 
 def main():
-    logger.info("Starting DexTool Scanner Bot …")
+    logger.info("Starting DexTool Scanner Bot \u2026")
 
     app = (
         Application.builder()
@@ -750,13 +805,13 @@ def main():
     app.add_handler(CommandHandler("users", cmd_users))
 
     def _handle_signal(signum, frame):
-        logger.info("Received signal %s – shutting down", signum)
+        logger.info("Received signal %s \u2013 shutting down", signum)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    logger.info("Polling for Telegram updates …")
+    logger.info("Polling for Telegram updates \u2026")
     app.run_polling(drop_pending_updates=True)
 
 

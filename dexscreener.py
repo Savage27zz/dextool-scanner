@@ -131,8 +131,8 @@ async def _enrich_from_dexscreener(
             if age_hours > 24:
                 logger.debug("DexScreener skip %s – age %.1fh > 24h", symbol, age_hours)
                 return None
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Age parse error for %s: %s", symbol, exc)
 
     if market_cap > 0 and (market_cap < MIN_MCAP or market_cap > MAX_MCAP):
         logger.debug("DexScreener skip %s – mcap $%.0f outside range", symbol, market_cap)

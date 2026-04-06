@@ -37,6 +37,7 @@ BUY_PERCENT: int = _env("BUY_PERCENT", default="50", cast=int)
 TAKE_PROFIT: int = _env("TAKE_PROFIT", default="20", cast=int)
 STOP_LOSS: int = _env("STOP_LOSS", default="-50", cast=int)
 TRAILING_STOP: int = _env("TRAILING_STOP", default="0", cast=int)
+SELL_PERCENT: int = _env("SELL_PERCENT", default="100", cast=int)
 SLIPPAGE: int = _env("SLIPPAGE", default="15", cast=int)
 
 MIN_LIQUIDITY: int = _env("MIN_LIQUIDITY", default="5000", cast=int)
@@ -48,6 +49,7 @@ MONITOR_INTERVAL: int = _env("MONITOR_INTERVAL", default="30", cast=int)
 
 MIN_SCORE: int = _env("MIN_SCORE", default="40", cast=int)
 MAX_POSITIONS: int = _env("MAX_POSITIONS", default="5", cast=int)
+DRY_RUN: bool = _env("DRY_RUN", default="false", cast=lambda v: str(v).lower() in ("true", "1", "yes"))
 
 DEXTOOLS_BASE_URL = f"https://public-api.dextools.io/{DEXTOOLS_PLAN}/v2"
 
