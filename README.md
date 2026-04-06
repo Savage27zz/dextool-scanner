@@ -72,6 +72,33 @@ Edit `.env` with your values:
 | `ANTIRUG_MIN_LIQ` | Emergency sell if liquidity drops below this USD amount | `1000` |
 | `ANTIRUG_LIQ_DROP_PCT` | Emergency sell if liquidity drops by this % from entry | `70` |
 
+## Docker (recommended)
+
+The easiest way to run the bot — no Python install needed.
+
+1. Install [Docker Desktop](https://docker.com/products/docker-desktop/)
+2. Clone the repo and configure:
+   ```bash
+   git clone https://github.com/Savage27zz/dextool-scanner.git
+   cd dextool-scanner
+   cp .env.example .env
+   # Edit .env with your keys
+   ```
+3. Start the bot:
+   ```bash
+   docker compose up -d
+   ```
+4. View logs:
+   ```bash
+   docker compose logs -f
+   ```
+5. Stop the bot:
+   ```bash
+   docker compose down
+   ```
+
+Data (database + logs) is persisted in the `data/` directory.
+
 ## Usage
 
 ```bash

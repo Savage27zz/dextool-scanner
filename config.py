@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
 
 
 def _env(key: str, default=None, cast=None, required=False):
@@ -94,7 +96,7 @@ def _build_logger() -> logging.Logger:
     )
 
     fh = RotatingFileHandler(
-        BASE_DIR / "trading.log",
+        DATA_DIR / "trading.log",
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
         encoding="utf-8",

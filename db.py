@@ -3,9 +3,9 @@ from pathlib import Path
 
 import aiosqlite
 
-from config import logger, BASE_DIR
+from config import logger, DATA_DIR
 
-DB_PATH = BASE_DIR / "trading.db"
+DB_PATH = DATA_DIR / "trading.db"
 
 _CREATE_DETECTED_TOKENS = """
 CREATE TABLE IF NOT EXISTS detected_tokens (
