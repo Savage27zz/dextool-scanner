@@ -1,0 +1,1 @@
+# dextool-scanner
