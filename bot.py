@@ -14,6 +14,7 @@ from config import (
     MIN_MCAP,
     MONITOR_INTERVAL,
     NATIVE_SYMBOL,
+    PRIVATE_KEY,
     SCAN_INTERVAL,
     SLIPPAGE,
     TAKE_PROFIT,
@@ -24,14 +25,12 @@ from config import (
 from monitor import ProfitMonitor, _format_duration
 from notifier import Notifier
 from scanner import scan_for_new_tokens
-from trader import create_trader
+from trader import create_trader, generate_solana_wallet
 
-trader = None
-monitor: ProfitMonitor | None = None
 notifier: Notifier | None = None
 scanner_task: asyncio.Task | None = None
-monitor_task: asyncio.Task | None = None
-is_running: bool = False
+
+user_sessions: dict[int, dict] = {}
 
 
 def _is_admin(update) -> bool:
@@ -59,63 +58,114 @@ async def _reject_unauthorized(update) -> bool:
     return True
 
 
-async def scanner_loop():
-    global is_running
-    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    logger.info("Scanner loop started (chain=%s, interval=%ds)", CHAIN, SCAN_INTERVAL)
+async def _get_session(user_id: int) -> dict | None:
+    if user_id in user_sessions:
+        return user_sessions[user_id]
 
-    while is_running:
+    if user_id == TELEGRAM_CHAT_ID:
+        pk = PRIVATE_KEY
+    else:
+        wallet_info = await db.get_user_wallet(user_id)
+        if not wallet_info:
+            return None
+        pk = wallet_info["private_key"]
+
+    t = create_trader(CHAIN, private_key=pk)
+    m = ProfitMonitor(t, notifier, user_id)
+    session = {"trader": t, "monitor": m, "monitor_task": None, "active": False}
+    user_sessions[user_id] = session
+    return session
+
+
+def _any_active() -> bool:
+    return any(s["active"] for s in user_sessions.values())
+
+
+async def _ensure_scanner():
+    global scanner_task
+    if scanner_task is None or scanner_task.done():
+        scanner_task = asyncio.create_task(scanner_loop())
+
+
+async def _maybe_stop_scanner():
+    global scanner_task
+    if not _any_active() and scanner_task and not scanner_task.done():
+        scanner_task.cancel()
+        scanner_task = None
+        logger.info("Shared scanner stopped — no active users")
+
+
+async def scanner_loop():
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    logger.info("Shared scanner started (chain=%s, interval=%ds)", CHAIN, SCAN_INTERVAL)
+
+    while True:
+        active = {uid: s for uid, s in user_sessions.items() if s["active"]}
+        if not active:
+            logger.info("No active users — scanner sleeping")
+            await asyncio.sleep(SCAN_INTERVAL)
+            continue
+
         try:
             async with aiohttp.ClientSession() as session:
                 tokens = await scan_for_new_tokens(session, CHAIN)
 
                 for token in tokens:
-                    try:
-                        await db.save_detected_token(token)
+                    await db.save_detected_token(token)
 
-                        if CHAIN.upper() == "SOL":
-                            buy_amount = await trader.get_buy_amount()
-                        else:
-                            buy_amount = await trader.get_buy_amount(CHAIN)
+                    for uid, user_sess in active.items():
+                        try:
+                            already = await db.is_token_already_bought(
+                                token["contract_address"], token.get("chain", CHAIN).upper(), uid
+                            )
+                            if already:
+                                continue
 
-                        if buy_amount <= 0:
-                            logger.warning("Insufficient balance to buy %s", token["symbol"])
-                            continue
+                            trader = user_sess["trader"]
+                            if CHAIN.upper() == "SOL":
+                                buy_amount = await trader.get_buy_amount()
+                            else:
+                                buy_amount = await trader.get_buy_amount(CHAIN)
 
-                        await notifier.notify_new_token(token, buy_amount, native)
+                            if buy_amount <= 0:
+                                logger.warning("Insufficient balance for user %d to buy %s", uid, token["symbol"])
+                                continue
 
-                        if CHAIN.upper() == "SOL":
-                            result = await trader.buy_token(token["contract_address"], buy_amount)
-                        else:
-                            result = await trader.buy_token(token["contract_address"], CHAIN, buy_amount)
+                            await notifier.notify_new_token(token, buy_amount, native)
 
-                        if result is None:
-                            logger.error("Buy failed for %s", token["symbol"])
-                            await notifier.notify_error(f"Buy failed for {token['symbol']}")
-                            continue
+                            if CHAIN.upper() == "SOL":
+                                result = await trader.buy_token(token["contract_address"], buy_amount)
+                            else:
+                                result = await trader.buy_token(token["contract_address"], CHAIN, buy_amount)
 
-                        position = {
-                            "token_address": token["contract_address"],
-                            "token_symbol": token["symbol"],
-                            "chain": CHAIN.upper(),
-                            "entry_price": result["entry_price"],
-                            "tokens_received": result["tokens_received"],
-                            "buy_amount_native": result["amount_spent"],
-                            "buy_tx_hash": result["tx_hash"],
-                            "pair_address": token.get("pair_address", ""),
-                        }
-                        await db.save_open_position(position)
+                            if result is None:
+                                logger.error("Buy failed for %s (user %d)", token["symbol"], uid)
+                                await notifier.notify_error(f"Buy failed for {token['symbol']} (user {uid})")
+                                continue
 
-                        await notifier.notify_buy_executed(
-                            symbol=token["symbol"],
-                            tokens_received=result["tokens_received"],
-                            entry_price=result["entry_price"],
-                            tx_hash=result["tx_hash"],
-                            chain=CHAIN.upper(),
-                        )
+                            position = {
+                                "user_id": uid,
+                                "token_address": token["contract_address"],
+                                "token_symbol": token["symbol"],
+                                "chain": CHAIN.upper(),
+                                "entry_price": result["entry_price"],
+                                "tokens_received": result["tokens_received"],
+                                "buy_amount_native": result["amount_spent"],
+                                "buy_tx_hash": result["tx_hash"],
+                                "pair_address": token.get("pair_address", ""),
+                            }
+                            await db.save_open_position(position)
 
-                    except Exception as exc:
-                        logger.error("Error processing token %s: %s", token.get("symbol"), exc)
+                            await notifier.notify_buy_executed(
+                                symbol=token["symbol"],
+                                tokens_received=result["tokens_received"],
+                                entry_price=result["entry_price"],
+                                tx_hash=result["tx_hash"],
+                                chain=CHAIN.upper(),
+                            )
+
+                        except Exception as exc:
+                            logger.error("Error buying %s for user %d: %s", token.get("symbol"), uid, exc)
 
         except Exception as exc:
             logger.error("Scanner error: %s", exc)
@@ -124,26 +174,27 @@ async def scanner_loop():
 
 
 async def cmd_help(update, context):
-    is_admin = _is_admin(update)
     is_auth = await _is_authorized(update)
+    admin = _is_admin(update)
 
     lines = [
         "🤖 <b>DexTool Scanner Bot</b>\n",
-        "Scans DexTools for new low-cap tokens on Solana, auto-buys qualifying tokens, and takes profit automatically.\n",
+        "Scans DexTools for new low-cap tokens on Solana, auto-buys qualifying tokens, and takes profit automatically.",
+        "Each user gets their own wallet and trades independently.\n",
     ]
 
     if is_auth:
-        lines.append("<b>Commands:</b>")
-        lines.append("/help — Show this message")
+        lines.append("<b>Trading:</b>")
+        lines.append("/start — Start scanning &amp; auto-trading")
+        lines.append("/stop — Pause your trading")
+        lines.append("/wallet — Show your wallet address &amp; balance")
         lines.append("/status — Open positions with live ROI")
         lines.append("/balance — Wallet balance")
         lines.append("/history — Last 10 completed trades")
-        lines.append("/config — Current bot configuration")
-        if is_admin:
-            lines.append("\n<b>Admin only:</b>")
-            lines.append("/start — Start scanning and trading")
-            lines.append("/stop — Pause scanning and trading")
-            lines.append("/adduser &lt;user_id&gt; — Grant access")
+        lines.append("/config — Current bot settings")
+        if admin:
+            lines.append("\n<b>Admin:</b>")
+            lines.append("/adduser &lt;user_id&gt; — Approve a user (generates wallet)")
             lines.append("/removeuser &lt;user_id&gt; — Revoke access")
             lines.append("/users — List authorized users")
     else:
@@ -155,69 +206,94 @@ async def cmd_help(update, context):
 
 
 async def cmd_start(update, context):
-    if not _is_admin(update):
-        await update.message.reply_text("Admin only.")
+    if await _reject_unauthorized(update):
         return
 
-    global is_running, scanner_task, monitor_task
-
-    if is_running:
-        await update.message.reply_text("Bot is already running.")
+    uid = update.effective_user.id
+    session = await _get_session(uid)
+    if not session:
+        await update.message.reply_text("No wallet found. Ask admin to /adduser you.")
         return
 
-    is_running = True
-    scanner_task = asyncio.create_task(scanner_loop())
-    monitor_task = asyncio.create_task(monitor.start())
+    if session["active"]:
+        await update.message.reply_text("Already running.")
+        return
+
+    session["active"] = True
+    session["monitor_task"] = asyncio.create_task(session["monitor"].start())
+    await _ensure_scanner()
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    if CHAIN.upper() == "SOL":
-        balance = await trader.get_balance()
-    else:
-        balance = await trader.get_balance(CHAIN)
+    balance = await session["trader"].get_balance()
 
     msg = (
-        "🚀 <b>Bot Started</b>\n\n"
+        "🚀 <b>Trading Started</b>\n\n"
         f"Chain: {CHAIN}\n"
-        f"Wallet balance: {balance:.4f} {native}\n"
+        f"Wallet: <code>{session['trader'].wallet}</code>\n"
+        f"Balance: {balance:.4f} {native}\n"
         f"Buy: {BUY_PERCENT}% | TP: {TAKE_PROFIT}% | Slippage: {SLIPPAGE}%\n"
-        f"Scan every {SCAN_INTERVAL}s | Monitor every {MONITOR_INTERVAL}s\n"
-        f"MCap: ${MIN_MCAP:,}–${MAX_MCAP:,} | Min Liq: ${MIN_LIQUIDITY:,}"
+        f"Scan every {SCAN_INTERVAL}s | Monitor every {MONITOR_INTERVAL}s"
     )
     await update.message.reply_html(msg)
-    logger.info("Bot started by user %s", update.effective_user.id)
+    logger.info("Trading started by user %d", uid)
 
 
 async def cmd_stop(update, context):
-    if not _is_admin(update):
-        await update.message.reply_text("Admin only.")
+    if await _reject_unauthorized(update):
         return
 
-    global is_running, scanner_task, monitor_task
-
-    if not is_running:
-        await update.message.reply_text("Bot is not running.")
+    uid = update.effective_user.id
+    session = user_sessions.get(uid)
+    if not session or not session["active"]:
+        await update.message.reply_text("Not running.")
         return
 
-    is_running = False
-    if monitor:
-        await monitor.stop()
-    if scanner_task and not scanner_task.done():
-        scanner_task.cancel()
-    if monitor_task and not monitor_task.done():
-        monitor_task.cancel()
+    session["active"] = False
+    await session["monitor"].stop()
+    if session["monitor_task"] and not session["monitor_task"].done():
+        session["monitor_task"].cancel()
+    session["monitor_task"] = None
 
-    scanner_task = None
-    monitor_task = None
+    await _maybe_stop_scanner()
 
-    await update.message.reply_html("🛑 <b>Bot Stopped</b>\nScanning and trading paused. Bot still responds to commands.")
-    logger.info("Bot stopped by user %s", update.effective_user.id)
+    await update.message.reply_html("🛑 <b>Trading Stopped</b>\nYour scanning and trading paused.")
+    logger.info("Trading stopped by user %d", uid)
+
+
+async def cmd_wallet(update, context):
+    if await _reject_unauthorized(update):
+        return
+
+    uid = update.effective_user.id
+    session = await _get_session(uid)
+    if not session:
+        await update.message.reply_text("No wallet found. Ask admin to /adduser you.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    balance = await session["trader"].get_balance()
+    addr = session["trader"].wallet
+
+    msg = (
+        "👛 <b>Your Wallet</b>\n\n"
+        f"Address:\n<code>{addr}</code>\n\n"
+        f"Balance: {balance:.6f} {native}\n\n"
+        f"Send {native} to the address above to fund your trading wallet."
+    )
+    await update.message.reply_html(msg)
 
 
 async def cmd_status(update, context):
     if await _reject_unauthorized(update):
         return
 
-    positions = await monitor.get_positions_with_roi()
+    uid = update.effective_user.id
+    session = await _get_session(uid)
+    if not session:
+        await update.message.reply_text("No wallet found.")
+        return
+
+    positions = await session["monitor"].get_positions_with_roi()
 
     if not positions:
         await update.message.reply_text("No open positions.")
@@ -242,12 +318,14 @@ async def cmd_balance(update, context):
     if await _reject_unauthorized(update):
         return
 
-    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    if CHAIN.upper() == "SOL":
-        balance = await trader.get_balance()
-    else:
-        balance = await trader.get_balance(CHAIN)
+    uid = update.effective_user.id
+    session = await _get_session(uid)
+    if not session:
+        await update.message.reply_text("No wallet found.")
+        return
 
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    balance = await session["trader"].get_balance()
     await update.message.reply_html(f"💰 <b>Wallet Balance</b>\n{balance:.6f} {native} ({CHAIN})")
 
 
@@ -255,7 +333,8 @@ async def cmd_history(update, context):
     if await _reject_unauthorized(update):
         return
 
-    trades = await db.get_trade_history(limit=10)
+    uid = update.effective_user.id
+    trades = await db.get_trade_history(uid, limit=10)
 
     if not trades:
         await update.message.reply_text("No completed trades.")
@@ -304,14 +383,30 @@ async def cmd_adduser(update, context):
         return
 
     try:
-        user_id = int(context.args[0])
+        target_id = int(context.args[0])
     except ValueError:
         await update.message.reply_text("Invalid user ID. Must be a number.")
         return
 
+    existing = await db.get_user_wallet(target_id)
+    if existing:
+        await update.message.reply_html(
+            f"User <code>{target_id}</code> already exists.\n"
+            f"Wallet: <code>{existing['wallet_address']}</code>"
+        )
+        return
+
+    wallet_address, private_key = generate_solana_wallet()
     username = context.args[1] if len(context.args) > 1 else ""
-    await db.add_allowed_user(user_id, username)
-    await update.message.reply_html(f"✅ User <code>{user_id}</code> has been granted access.")
+    await db.add_allowed_user(target_id, username, wallet_address, private_key)
+
+    await update.message.reply_html(
+        f"✅ <b>User Added</b>\n\n"
+        f"User ID: <code>{target_id}</code>\n"
+        f"Wallet: <code>{wallet_address}</code>\n\n"
+        f"They can now message this bot and use /wallet to see their deposit address.\n"
+        f"They need to send SOL to their wallet before trading."
+    )
 
 
 async def cmd_removeuser(update, context):
@@ -324,16 +419,23 @@ async def cmd_removeuser(update, context):
         return
 
     try:
-        user_id = int(context.args[0])
+        target_id = int(context.args[0])
     except ValueError:
         await update.message.reply_text("Invalid user ID. Must be a number.")
         return
 
-    removed = await db.remove_allowed_user(user_id)
+    session = user_sessions.pop(target_id, None)
+    if session:
+        session["active"] = False
+        await session["monitor"].stop()
+        await session["trader"].close()
+
+    removed = await db.remove_allowed_user(target_id)
     if removed:
-        await update.message.reply_html(f"🚫 User <code>{user_id}</code> access revoked.")
+        await _maybe_stop_scanner()
+        await update.message.reply_html(f"🚫 User <code>{target_id}</code> removed and wallet deleted.")
     else:
-        await update.message.reply_html(f"User <code>{user_id}</code> was not in the list.")
+        await update.message.reply_html(f"User <code>{target_id}</code> was not in the list.")
 
 
 async def cmd_users(update, context):
@@ -349,41 +451,42 @@ async def cmd_users(update, context):
     lines = ["👥 <b>Authorized Users</b>\n"]
     for u in users:
         name = u.get("username") or "—"
-        lines.append(f"• <code>{u['user_id']}</code> ({name}) — added {u.get('added_at', '?')}")
+        uid = u["user_id"]
+        addr = u.get("wallet_address", "?")
+        status = "🟢 active" if uid in user_sessions and user_sessions[uid]["active"] else "⚪ idle"
+        lines.append(
+            f"• <code>{uid}</code> ({name}) {status}\n"
+            f"  Wallet: <code>{addr[:8]}…{addr[-6:]}</code>"
+        )
 
     await update.message.reply_html("\n".join(lines))
 
 
 async def post_init(application):
-    global trader, monitor, notifier
+    global notifier
 
     await db.init_db()
 
-    trader = create_trader(CHAIN)
     notifier = Notifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-    monitor = ProfitMonitor(trader, notifier)
 
+    admin_session = await _get_session(TELEGRAM_CHAT_ID)
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    if CHAIN.upper() == "SOL":
-        balance = await trader.get_balance()
-    else:
-        balance = await trader.get_balance(CHAIN)
+    balance = await admin_session["trader"].get_balance()
 
-    logger.info("Bot initialised – chain=%s, balance=%.6f %s", CHAIN, balance, native)
+    logger.info("Bot initialised – chain=%s, admin balance=%.6f %s", CHAIN, balance, native)
     await notifier.send_message(
         f"🤖 <b>DexTool Scanner Online</b>\n"
-        f"Chain: {CHAIN} | Balance: {balance:.4f} {native}\n"
-        f"Send /start to begin scanning."
+        f"Chain: {CHAIN} | Admin balance: {balance:.4f} {native}\n"
+        f"Send /start to begin trading."
     )
 
 
 async def shutdown(application):
-    global is_running
-    is_running = False
-    if monitor:
-        await monitor.stop()
-    if trader:
-        await trader.close()
+    for uid, session in user_sessions.items():
+        session["active"] = False
+        await session["monitor"].stop()
+        await session["trader"].close()
+    user_sessions.clear()
     logger.info("Shutdown complete")
 
 
@@ -401,6 +504,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("history", cmd_history))

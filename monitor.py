@@ -1,31 +1,30 @@
 import asyncio
 from datetime import datetime, timezone
 
-import aiohttp
-
 import db
 from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, TAKE_PROFIT, logger
 
 
 class ProfitMonitor:
-    def __init__(self, trader, notifier):
+    def __init__(self, trader, notifier, user_id: int):
         self.trader = trader
         self.notifier = notifier
+        self.user_id = user_id
         self.running = False
 
     async def start(self):
         self.running = True
-        logger.info("ProfitMonitor started (interval=%ds, TP=%d%%)", MONITOR_INTERVAL, TAKE_PROFIT)
+        logger.info("ProfitMonitor started for user %d (interval=%ds, TP=%d%%)", self.user_id, MONITOR_INTERVAL, TAKE_PROFIT)
         while self.running:
             try:
                 await self.check_positions()
             except Exception as exc:
-                logger.error("Monitor error: %s", exc)
+                logger.error("Monitor error (user %d): %s", self.user_id, exc)
             await asyncio.sleep(MONITOR_INTERVAL)
 
     async def stop(self):
         self.running = False
-        logger.info("ProfitMonitor stopped")
+        logger.info("ProfitMonitor stopped for user %d", self.user_id)
 
     async def _get_current_price(self, token_address: str, chain: str) -> float:
         if chain.upper() == "SOL":
@@ -33,11 +32,11 @@ class ProfitMonitor:
         return await self.trader.get_token_price_onchain(token_address, chain)
 
     async def check_positions(self):
-        positions = await db.get_open_positions()
+        positions = await db.get_open_positions(self.user_id)
         if not positions:
             return
 
-        logger.debug("Checking %d open positions", len(positions))
+        logger.debug("Checking %d open positions for user %d", len(positions), self.user_id)
 
         for pos in positions:
             token_address = pos["token_address"]
@@ -52,28 +51,28 @@ class ProfitMonitor:
                     continue
 
                 roi = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
-                logger.debug("%s ROI: %.2f%% (entry=%.10f, current=%.10f)", symbol, roi, entry_price, current_price)
+                logger.debug("%s ROI: %.2f%% (entry=%.10f, current=%.10f) user %d", symbol, roi, entry_price, current_price, self.user_id)
 
                 if roi >= TAKE_PROFIT:
-                    logger.info("TP target hit for %s – ROI %.2f%% >= %d%%", symbol, roi, TAKE_PROFIT)
+                    logger.info("TP target hit for %s – ROI %.2f%% >= %d%% (user %d)", symbol, roi, TAKE_PROFIT, self.user_id)
 
                     if chain.upper() == "SOL":
                         ui_balance, decimals = await self.trader.get_token_balance(token_address)
                         tokens_raw = int(ui_balance * (10**decimals)) if decimals > 0 else int(ui_balance * 1e9)
                         if tokens_raw <= 0:
-                            logger.warning("Zero balance for %s – skipping sell", symbol)
+                            logger.warning("Zero balance for %s – skipping sell (user %d)", symbol, self.user_id)
                             continue
                         sell_result = await self.trader.sell_token(token_address, tokens_raw, decimals)
                     else:
                         ui_balance, decimals = await self.trader.get_token_balance(token_address, chain)
                         tokens_raw = int(ui_balance * (10**decimals))
                         if tokens_raw <= 0:
-                            logger.warning("Zero balance for %s – skipping sell", symbol)
+                            logger.warning("Zero balance for %s – skipping sell (user %d)", symbol, self.user_id)
                             continue
                         sell_result = await self.trader.sell_token(token_address, chain, tokens_raw, decimals)
 
                     if sell_result is None:
-                        logger.error("Sell failed for %s", symbol)
+                        logger.error("Sell failed for %s (user %d)", symbol, self.user_id)
                         await self.notifier.notify_error(f"Sell failed for {symbol} ({token_address})")
                         continue
 
@@ -98,10 +97,9 @@ class ProfitMonitor:
                         "duration_seconds": duration_seconds,
                     }
 
-                    await db.close_position(token_address, chain, exit_data)
+                    await db.close_position(token_address, chain, self.user_id, exit_data)
 
                     duration_str = _format_duration(duration_seconds)
-                    native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
                     profit_native = sell_result["native_received"] - pos["buy_amount_native"]
 
                     await self.notifier.notify_take_profit(
@@ -116,10 +114,10 @@ class ProfitMonitor:
                     )
 
             except Exception as exc:
-                logger.error("Error checking position %s: %s", symbol, exc)
+                logger.error("Error checking position %s (user %d): %s", symbol, self.user_id, exc)
 
     async def get_positions_with_roi(self) -> list[dict]:
-        positions = await db.get_open_positions()
+        positions = await db.get_open_positions(self.user_id)
         enriched = []
         for pos in positions:
             token_address = pos["token_address"]

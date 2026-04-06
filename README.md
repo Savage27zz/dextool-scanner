@@ -69,31 +69,40 @@ The bot will connect to Telegram and send a startup message. Use commands to con
 
 ## Bot Commands
 
-**Anyone** (including unapproved users):
+**Anyone** (unapproved users):
 | Command | Description |
 |---|---|
 | `/help` | Show bot info and available commands |
 
-**Authorized users** (admin + approved friends):
+**Authorized users** (admin + approved friends — each gets their own wallet):
 | Command | Description |
 |---|---|
-| `/status` | Show open positions with live ROI |
-| `/balance` | Show current wallet balance |
-| `/history` | Show last 10 completed trades |
-| `/config` | Display current configuration |
+| `/start` | Start scanning and auto-trading with your wallet |
+| `/stop` | Pause your trading |
+| `/wallet` | Show your wallet address and balance |
+| `/status` | Show your open positions with live ROI |
+| `/balance` | Show your wallet balance |
+| `/history` | Show your last 10 completed trades |
+| `/config` | Display current bot settings |
 
 **Admin only** (`TELEGRAM_CHAT_ID` owner):
 | Command | Description |
 |---|---|
-| `/start` | Start scanning and auto-trading |
-| `/stop` | Stop scanning (bot stays responsive) |
-| `/adduser <id>` | Grant a friend read-only access |
-| `/removeuser <id>` | Revoke a user's access |
-| `/users` | List all authorized users |
+| `/adduser <id>` | Approve a user and generate their wallet |
+| `/removeuser <id>` | Revoke access and delete wallet |
+| `/users` | List all authorized users and their status |
 
-### Sharing with friends
+### Multi-user wallets
 
-Your friends can message the bot directly on Telegram — no GitHub or setup needed. When they send any command, the bot shows them their user ID. You then run `/adduser <their_id>` to grant them read-only access to positions, balance, history, and config.
+Each approved user gets an auto-generated Solana wallet. Positions, balances, and trades are completely separate per user. The flow:
+
+1. Friend messages the bot on Telegram — the bot shows their user ID
+2. Admin runs `/adduser <their_id>` — a new Solana wallet is generated
+3. Friend runs `/wallet` to see their deposit address
+4. Friend sends SOL to that address
+5. Friend runs `/start` to begin trading
+
+No GitHub access, no setup, no config files — everything happens in Telegram.
 
 ## Architecture
 

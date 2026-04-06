@@ -23,6 +23,14 @@ from config import (
     logger,
 )
 
+
+def generate_solana_wallet() -> tuple[str, str]:
+    """Generate a new Solana keypair. Returns (wallet_address, private_key_base58)."""
+    kp = Keypair()
+    address = str(kp.pubkey())
+    pk = base58.b58encode(bytes(kp)).decode()
+    return address, pk
+
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
@@ -170,8 +178,8 @@ def _load_solana_keypair(raw: str) -> Keypair:
 
 
 class SolanaTrader:
-    def __init__(self):
-        self.keypair = _load_solana_keypair(PRIVATE_KEY)
+    def __init__(self, private_key: str | None = None):
+        self.keypair = _load_solana_keypair(private_key or PRIVATE_KEY)
         self.client = AsyncClient(RPC_URL_SOL, commitment=Confirmed)
         self.wallet = str(self.keypair.pubkey())
         logger.info("SolanaTrader initialised – wallet %s", self.wallet)
@@ -685,8 +693,8 @@ class EVMTrader:
         pass
 
 
-def create_trader(chain: str | None = None):
+def create_trader(chain: str | None = None, private_key: str | None = None):
     chain = (chain or CHAIN).upper()
     if chain == "SOL":
-        return SolanaTrader()
+        return SolanaTrader(private_key=private_key)
     return EVMTrader()

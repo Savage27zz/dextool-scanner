@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
-import db
 from config import (
     CHAIN,
     CHAIN_MAP,
@@ -249,11 +248,6 @@ async def _enrich_token(session: aiohttp.ClientSession, chain_id: str, address: 
 
     if liquidity < MIN_LIQUIDITY:
         logger.debug("Skipping %s – liquidity $%.0f < min $%d", symbol, liquidity, MIN_LIQUIDITY)
-        return None
-
-    already = await db.is_token_already_bought(address, chain)
-    if already:
-        logger.debug("Skipping %s – already bought", symbol)
         return None
 
     info_data = await _fetch_token_info(session, chain_id, address)
