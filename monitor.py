@@ -5,6 +5,7 @@ import aiohttp
 
 import db
 from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, STOP_LOSS, TAKE_PROFIT, TRAILING_DROP, TRAILING_ENABLED, ANTIRUG_ENABLED, ANTIRUG_MIN_LIQ, ANTIRUG_LIQ_DROP_PCT, TELEGRAM_CHAT_ID, logger
+from fee_collector import collect_fee
 from dexscreener import get_token_liquidity
 from trader import create_user_trader, SolanaTrader
 
@@ -98,6 +99,30 @@ class ProfitMonitor:
             f"ROI {roi:+.2f}% | {sign}{native_amount:.4f} {native}",
         )
 
+    async def _try_collect_fee(self, user_id: int, symbol: str, profit_native: float, notify_chat_id: int | None):
+        try:
+            admin_wallet = await db.get_user_wallet(TELEGRAM_CHAT_ID)
+            if not admin_wallet:
+                return
+            fee_result = await collect_fee(
+                user_id=user_id,
+                token_symbol=symbol,
+                profit_native=profit_native,
+                admin_public_key=admin_wallet["public_key"],
+            )
+            if fee_result and fee_result.get("tx_hash"):
+                await self.notifier.send_to_user(
+                    user_id,
+                    f"💰 Operator fee: {fee_result['fee_amount']:.6f} SOL "
+                    f"({fee_result['fee_pct']:.1f}% of {profit_native:.6f} SOL profit)",
+                )
+                await self.notifier.send_message(
+                    f"💰 Fee collected: {fee_result['fee_amount']:.6f} SOL from user {user_id} "
+                    f"({fee_result['fee_pct']:.1f}% of {profit_native:.6f} SOL profit on {symbol})",
+                )
+        except Exception as exc:
+            logger.error("Fee collection error for user %d: %s", user_id, exc)
+
     async def check_positions(self):
         positions = await db.get_open_positions()
         if not positions:
@@ -175,6 +200,8 @@ class ProfitMonitor:
                                 chat_id=notify_chat_id,
                             )
                             await self._admin_summary(user_id, "Anti-rug sell", symbol, round(roi, 2), loss_native)
+                            if loss_native > 0:
+                                await self._try_collect_fee(user_id, symbol, loss_native, notify_chat_id)
                         continue
 
                 current_price = await self._get_current_price(token_address, chain)
@@ -237,6 +264,8 @@ class ProfitMonitor:
                                         chat_id=notify_chat_id,
                                     )
                                     await self._admin_summary(user_id, "Trailing-TP sell", symbol, round(roi, 2), profit_native)
+                                    if profit_native > 0:
+                                        await self._try_collect_fee(user_id, symbol, profit_native, notify_chat_id)
 
                 else:
                     if roi >= TAKE_PROFIT:
@@ -259,6 +288,8 @@ class ProfitMonitor:
                                 chat_id=notify_chat_id,
                             )
                             await self._admin_summary(user_id, "Take-profit sell", symbol, round(roi, 2), profit_native)
+                            if profit_native > 0:
+                                await self._try_collect_fee(user_id, symbol, profit_native, notify_chat_id)
 
                 if not sold and STOP_LOSS < 0 and roi <= STOP_LOSS:
                     logger.info("SL hit for %s – ROI %.2f%% <= %d%%", symbol, roi, STOP_LOSS)
@@ -279,6 +310,8 @@ class ProfitMonitor:
                             chat_id=notify_chat_id,
                         )
                         await self._admin_summary(user_id, "Stop-loss sell", symbol, round(roi, 2), loss_native)
+                        if loss_native > 0:
+                            await self._try_collect_fee(user_id, symbol, loss_native, notify_chat_id)
 
             except Exception as exc:
                 logger.error("Error checking position %s: %s", symbol, exc)

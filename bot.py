@@ -41,9 +41,12 @@ from config import (
     ANTIRUG_ENABLED,
     ANTIRUG_MIN_LIQ,
     ANTIRUG_LIQ_DROP_PCT,
+    OPERATOR_FEE_PCT,
+    OPERATOR_FEE_ENABLED,
     logger,
 )
 from crypto_utils import encrypt_key, decrypt_key
+from fee_collector import collect_fee
 from monitor import ProfitMonitor, _format_duration
 from notifier import Notifier
 from honeypot import check_honeypot
@@ -252,6 +255,7 @@ async def cmd_help(update, context):
             lines.append("/addwhale &lt;address&gt; [label] — Track a whale wallet")
             lines.append("/removewhale &lt;address&gt; — Stop tracking a whale wallet")
             lines.append("/whales — List tracked whales &amp; recent events")
+            lines.append("/fees — Fee revenue stats")
     else:
         uid = update.effective_user.id
         lines.append(f"Your user ID: <code>{uid}</code>")
@@ -625,7 +629,8 @@ async def cmd_config(update, context):
         f"Whale Min SOL: {WHALE_MIN_SOL} SOL\n"
         f"Anti-Rug: {'Enabled' if ANTIRUG_ENABLED else 'Disabled'}\n"
         f"Anti-Rug Min Liquidity: ${ANTIRUG_MIN_LIQ:,}\n"
-        f"Anti-Rug Drop Threshold: {ANTIRUG_LIQ_DROP_PCT}%"
+        f"Anti-Rug Drop Threshold: {ANTIRUG_LIQ_DROP_PCT}%\n"
+        f"Operator Fee: {OPERATOR_FEE_PCT}% ({'Enabled' if OPERATOR_FEE_ENABLED else 'Disabled'})"
     )
     await update.message.reply_html(msg)
 
@@ -832,6 +837,27 @@ async def cmd_sell(update, context):
                     "duration_seconds": duration_seconds,
                 }
                 await db.close_position(pos["token_address"], CHAIN.upper(), exit_data, user_id=user_id)
+
+                profit_native = result["native_received"] - pos["buy_amount_native"]
+                if profit_native > 0:
+                    admin_wallet_data = await db.get_user_wallet(TELEGRAM_CHAT_ID)
+                    if admin_wallet_data:
+                        fee_result = await collect_fee(
+                            user_id=user_id,
+                            token_symbol=pos["token_symbol"],
+                            profit_native=profit_native,
+                            admin_public_key=admin_wallet_data["public_key"],
+                        )
+                        if fee_result and fee_result.get("tx_hash"):
+                            await update.message.reply_html(
+                                f"💰 Operator fee: {fee_result['fee_amount']:.6f} SOL "
+                                f"({fee_result['fee_pct']:.1f}% of profit)"
+                            )
+                            await notifier.send_message(
+                                f"💰 Fee collected: {fee_result['fee_amount']:.6f} SOL from user {user_id} "
+                                f"({fee_result['fee_pct']:.1f}% of {profit_native:.6f} SOL profit on {pos['token_symbol']})"
+                            )
+
                 break
 
     tx_url = EXPLORER_TX.get(CHAIN.upper(), EXPLORER_TX["SOL"]).format(result["tx_hash"])
@@ -1247,6 +1273,43 @@ async def cmd_whales(update, context):
     await update.message.reply_html("\n".join(lines))
 
 
+async def cmd_fees(update, context):
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    stats = await db.get_fee_stats()
+    recent = await db.get_fee_history(limit=10)
+
+    msg_parts = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "💰 <b>FEE REVENUE</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"Fee Rate: {OPERATOR_FEE_PCT}%",
+        f"Status: {'✅ Enabled' if OPERATOR_FEE_ENABLED else '❌ Disabled'}",
+        "",
+        "<b>Totals</b>",
+        f"   Collected: {stats.get('total_collected', 0):.6f} SOL",
+        f"   Pending: {stats.get('total_pending', 0):.6f} SOL",
+        f"   Failed: {stats.get('total_failed', 0):.6f} SOL",
+        f"   Total Trades: {stats.get('count', 0)}",
+    ]
+
+    if recent:
+        msg_parts.append("")
+        msg_parts.append("<b>Recent Fees</b>")
+        for f in recent:
+            status_icon = "✅" if f["status"] == "collected" else "❌" if f["status"] == "failed" else "⏳"
+            msg_parts.append(
+                f"  {status_icon} {f['token_symbol']} — {f['fee_amount_native']:.6f} SOL "
+                f"(user {f['user_id']})"
+            )
+
+    await update.message.reply_html("\n".join(msg_parts))
+
+
 async def post_init(application):
     global trader, monitor, notifier, whale_tracker
 
@@ -1332,6 +1395,7 @@ def main():
     app.add_handler(CommandHandler("addwhale", cmd_addwhale))
     app.add_handler(CommandHandler("removewhale", cmd_removewhale))
     app.add_handler(CommandHandler("whales", cmd_whales))
+    app.add_handler(CommandHandler("fees", cmd_fees))
 
     def _handle_signal(signum, frame):
         logger.info("Received signal %s – shutting down", signum)

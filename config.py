@@ -60,6 +60,9 @@ ANTIRUG_ENABLED: bool = _env("ANTIRUG_ENABLED", default="true", cast=lambda v: v
 ANTIRUG_MIN_LIQ: int = _env("ANTIRUG_MIN_LIQ", default="1000", cast=int)
 ANTIRUG_LIQ_DROP_PCT: int = _env("ANTIRUG_LIQ_DROP_PCT", default="70", cast=int)
 
+OPERATOR_FEE_PCT: float = _env("OPERATOR_FEE_PCT", default="5", cast=float)
+OPERATOR_FEE_ENABLED: bool = _env("OPERATOR_FEE_ENABLED", default="true", cast=lambda v: v.lower() in ("true", "1", "yes"))
+
 DEXTOOLS_BASE_URL = f"https://public-api.dextools.io/{DEXTOOLS_PLAN}/v2"
 
 CHAIN_MAP = {
