@@ -124,6 +124,36 @@ class Notifier:
         )
         await self.send_message(msg)
 
+    async def notify_rug_pull(
+        self,
+        symbol: str,
+        entry_price: float,
+        exit_price: float,
+        roi: float,
+        loss_native: float,
+        duration: str,
+        tx_hash: str,
+        chain: str,
+        reason: str,
+    ):
+        """Send rug pull emergency sell notification."""
+        link = _tx_link(tx_hash, chain)
+        native = {"SOL": "SOL", "ETH": "ETH", "BSC": "BNB"}.get(chain.upper(), "SOL")
+        msg = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\U0001f6a8 <b>RUG PULL — EMERGENCY SELL</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"\U0001fa99 Token: {_esc(symbol)}\n"
+            f"⚠️ Reason: {_esc(reason)}\n"
+            f"Entry: {_fmt_price(entry_price)} → Exit: {_fmt_price(exit_price)}\n"
+            f"ROI: {roi:.2f}%\n"
+            f"Loss: {loss_native:.4f} {native}\n"
+            f"Duration: {duration}\n"
+            f"TX: {link}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_message(msg)
+
     async def notify_error(self, error_msg: str):
         msg = f"⚠️ <b>ERROR</b>\n<code>{_esc(error_msg)}</code>"
         await self.send_message(msg)

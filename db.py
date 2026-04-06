@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS open_positions (
     pair_address TEXT,
     peak_price REAL DEFAULT 0,
     trailing_activated INTEGER DEFAULT 0,
+    entry_liquidity REAL DEFAULT 0,
     opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(token_address, chain)
 );
@@ -127,6 +128,10 @@ async def init_db():
             await db.execute("ALTER TABLE open_positions ADD COLUMN trailing_activated INTEGER DEFAULT 0")
         except Exception:
             pass  # column already exists
+        try:
+            await db.execute("ALTER TABLE open_positions ADD COLUMN entry_liquidity REAL DEFAULT 0")
+        except Exception:
+            pass  # column already exists
         await db.commit()
     logger.info("Database initialised at %s", DB_PATH)
 
@@ -171,8 +176,8 @@ async def save_open_position(position: dict):
     sql = """
         INSERT INTO open_positions
             (token_address, token_symbol, chain, entry_price, tokens_received,
-             buy_amount_native, buy_tx_hash, pair_address)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             buy_amount_native, buy_tx_hash, pair_address, entry_liquidity)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         position["token_address"],
@@ -183,6 +188,7 @@ async def save_open_position(position: dict):
         position["buy_amount_native"],
         position["buy_tx_hash"],
         position.get("pair_address"),
+        position.get("entry_liquidity", 0),
     )
     async with aiosqlite.connect(str(DB_PATH)) as db:
         await db.execute(sql, params)

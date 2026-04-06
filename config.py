@@ -53,6 +53,10 @@ WHALE_TRACKING_ENABLED: bool = _env("WHALE_TRACKING_ENABLED", default="true", ca
 WHALE_CHECK_INTERVAL: int = _env("WHALE_CHECK_INTERVAL", default="45", cast=int)
 WHALE_MIN_SOL: float = _env("WHALE_MIN_SOL", default="1.0", cast=float)
 
+ANTIRUG_ENABLED: bool = _env("ANTIRUG_ENABLED", default="true", cast=lambda v: v.lower() in ("true", "1", "yes"))
+ANTIRUG_MIN_LIQ: int = _env("ANTIRUG_MIN_LIQ", default="1000", cast=int)
+ANTIRUG_LIQ_DROP_PCT: int = _env("ANTIRUG_LIQ_DROP_PCT", default="70", cast=int)
+
 DEXTOOLS_BASE_URL = f"https://public-api.dextools.io/{DEXTOOLS_PLAN}/v2"
 
 CHAIN_MAP = {

@@ -198,6 +198,16 @@ async def _enrich_from_dexscreener(
     }
 
 
+async def get_token_liquidity(session: aiohttp.ClientSession, chain: str, token_address: str) -> float:
+    """Fetch current USD liquidity for a token from DexScreener. Returns 0.0 on failure."""
+    chain_id = DS_CHAIN_MAP.get(chain.upper(), "solana")
+    pairs = await _fetch_token_pairs(session, chain_id, token_address)
+    if not pairs:
+        return 0.0
+    best = max(pairs, key=lambda p: _safe_float((p.get("liquidity") or {}).get("usd")))
+    return _safe_float((best.get("liquidity") or {}).get("usd"))
+
+
 async def scan_dexscreener(session: aiohttp.ClientSession, chain: str | None = None) -> list[dict]:
     """
     Scan DexScreener for new tokens. Uses two discovery methods:
