@@ -18,6 +18,17 @@ DEXSCREENER_BASE = "https://api.dexscreener.com"
 
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 2
+_ds_rate_limit_count = 0
+
+
+def _ds_record_rate_limit():
+    global _ds_rate_limit_count
+    _ds_rate_limit_count += 1
+
+
+def _ds_reset_rate_limits():
+    global _ds_rate_limit_count
+    _ds_rate_limit_count = 0
 
 
 async def _ds_get(session: aiohttp.ClientSession, path: str, params: dict | None = None) -> dict | list | None:
@@ -30,6 +41,7 @@ async def _ds_get(session: aiohttp.ClientSession, path: str, params: dict | None
                     logger.debug("DexScreener API OK %s", path)
                     return data
                 if resp.status == 429:
+                    _ds_record_rate_limit()
                     wait = _BACKOFF_BASE ** attempt
                     logger.warning("DexScreener rate-limited on %s – retry in %ds", path, wait)
                     await asyncio.sleep(wait)
@@ -236,6 +248,7 @@ async def scan_dexscreener(session: aiohttp.ClientSession, chain: str | None = N
 
     qualifying: list[dict] = []
     batch_size = 5
+    _ds_reset_rate_limits()
     for i in range(0, len(candidates), batch_size):
         batch = candidates[i:i + batch_size]
         tasks = [_enrich_from_dexscreener(session, chain_id, addr, chain) for addr in batch]
@@ -247,7 +260,12 @@ async def scan_dexscreener(session: aiohttp.ClientSession, chain: str | None = N
             if result is not None:
                 qualifying.append(result)
         if i + batch_size < len(candidates):
-            await asyncio.sleep(0.5)
+            if _ds_rate_limit_count >= 5:
+                backoff = min(30, 5 * (_ds_rate_limit_count // 5))
+                logger.warning("DexScreener cycle backoff: %d rate limits — pausing %ds", _ds_rate_limit_count, backoff)
+                await asyncio.sleep(backoff)
+            else:
+                await asyncio.sleep(0.5)
 
     logger.info("DexScreener scan complete – %d qualifying tokens", len(qualifying))
     return qualifying

@@ -78,6 +78,19 @@ CREATE TABLE IF NOT EXISTS allowed_users (
 );
 """
 
+_CREATE_PRICE_ALERTS = """
+CREATE TABLE IF NOT EXISTS price_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_address TEXT NOT NULL,
+    token_symbol TEXT NOT NULL,
+    chain TEXT NOT NULL,
+    target_price REAL NOT NULL,
+    direction TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    triggered INTEGER DEFAULT 0
+);
+"""
+
 
 async def _conn() -> aiosqlite.Connection:
     db = await aiosqlite.connect(str(DB_PATH))
@@ -94,6 +107,7 @@ async def init_db():
         await db.execute(_CREATE_OPEN_POSITIONS)
         await db.execute(_CREATE_COMPLETED_TRADES)
         await db.execute(_CREATE_ALLOWED_USERS)
+        await db.execute(_CREATE_PRICE_ALERTS)
         await db.commit()
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
@@ -348,6 +362,37 @@ async def reduce_position(token_address: str, chain: str, fraction_sold: float):
         "Reduced position %s on %s by %.0f%% — %.4f tokens remaining",
         token_address, chain, fraction_sold * 100, new_tokens,
     )
+
+
+async def save_price_alert(token_address: str, token_symbol: str, chain: str, target_price: float, direction: str):
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute(
+            "INSERT INTO price_alerts (token_address, token_symbol, chain, target_price, direction) VALUES (?, ?, ?, ?, ?)",
+            (token_address, token_symbol, chain, target_price, direction),
+        )
+        await conn.commit()
+    logger.info("Saved price alert for %s: %s %.10f", token_symbol, direction, target_price)
+
+
+async def get_active_alerts() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM price_alerts WHERE triggered = 0 ORDER BY created_at")
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def trigger_alert(alert_id: int):
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute("UPDATE price_alerts SET triggered = 1 WHERE id = ?", (alert_id,))
+        await conn.commit()
+
+
+async def delete_alert(alert_id: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute("DELETE FROM price_alerts WHERE id = ?", (alert_id,))
+        await conn.commit()
+        return cursor.rowcount > 0
 
 
 async def is_token_already_bought(contract_address: str, chain: str) -> bool:

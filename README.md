@@ -11,6 +11,11 @@ Automated Telegram trading bot that scans DexTools for newly launched low-cap to
 - **Honeypot protection** — dual-check via DexTools audit API + GoPlus Security blocks honeypot tokens before buying
 - **Configurable filters** — market cap range, minimum liquidity, honeypot detection
 - **Auto take-profit** — monitors positions and sells at target ROI
+- **Price alerts** — set custom price triggers with `/alert` and get notified
+- **Inline sell buttons** — quick 25%/50%/100% sell via Telegram buttons
+- **Trade export** — download full trade history as CSV with `/export`
+- **Config validation** — validates all settings at startup to prevent misconfigurations
+- **Rate limit handling** — cycle-level backoff when APIs return 429 Too Many Requests
 - **Telegram interface** — real-time notifications and bot commands
 - **SQLite persistence** — tracks detected tokens, open positions, and completed trades
 - **Rotating log files** — `trading.log` with automatic rotation (5 MB × 3 backups)
@@ -95,8 +100,12 @@ The bot will connect to Telegram and send a startup message. Use commands to con
 | `/start` | Start scanning and auto-trading |
 | `/stop` | Stop scanning (bot stays responsive) |
 | `/buy <address> [amount]` | Manually buy a token. Amount in SOL/ETH/BNB (default: configured %) |
-| `/sell <address> [percent]` | Manually sell a token. Percent 1-100 (default: 100%) |
+| `/sell <address> [percent]` | Manually sell a token. Percent 1-100 (default: 100%). No args = inline buttons |
 | `/portfolio` | Full portfolio overview: wallet balance, positions value, PnL breakdown, win rate |
+| `/alert <address> <above\|below> <price>` | Set a price alert for a token |
+| `/alerts` | View all active price alerts |
+| `/delalert <id>` | Delete a price alert |
+| `/export` | Export complete trade history as CSV file |
 | `/adduser <id>` | Grant a friend read-only access |
 | `/removeuser <id>` | Revoke a user's access |
 | `/users` | List all authorized users |
@@ -152,7 +161,7 @@ config.py ─── loaded by all modules (env vars + logger)
 | File | Purpose |
 |---|---|
 | `config.py` | Loads `.env`, validates config, sets up rotating logger |
-| `db.py` | SQLite async layer — detected tokens, positions, trade history |
+| `db.py` | SQLite async layer — detected tokens, positions, trade history, price alerts |
 | `scanner.py` | DexTools API v2 — scan, enrich, filter new tokens |
 | `trader.py` | `SolanaTrader` (Jupiter V6) + `EVMTrader` (web3.py) |
 | `monitor.py` | Background profit-monitoring loop |

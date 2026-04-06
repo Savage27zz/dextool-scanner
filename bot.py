@@ -1,10 +1,13 @@
 import asyncio
+import csv
+import io
 import signal
 import sys
 from datetime import datetime, timezone
 
 import aiohttp
-from telegram.ext import Application, CommandHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler
 
 import db
 from config import (
@@ -40,7 +43,9 @@ monitor: ProfitMonitor | None = None
 notifier: Notifier | None = None
 scanner_task: asyncio.Task | None = None
 monitor_task: asyncio.Task | None = None
+alert_task: asyncio.Task | None = None
 is_running: bool = False
+http_session: aiohttp.ClientSession | None = None
 
 
 def _is_admin(update) -> bool:
@@ -76,73 +81,114 @@ async def scanner_loop():
 
     while is_running:
         try:
-            async with aiohttp.ClientSession() as session:
-                tokens = await scan_all_sources(session, CHAIN)
+            tokens = await scan_all_sources(http_session, CHAIN)
 
-                for token in tokens:
-                    try:
-                        await db.save_detected_token(token)
+            for token in tokens:
+                try:
+                    await db.save_detected_token(token)
 
-                        open_positions = await db.get_open_positions()
-                        if len(open_positions) >= MAX_POSITIONS:
-                            logger.warning(
-                                "Max positions (%d) reached \u2014 skipping %s",
-                                MAX_POSITIONS, token["symbol"],
-                            )
-                            break
-
-                        if CHAIN.upper() == "SOL":
-                            buy_amount = await trader.get_buy_amount()
-                        else:
-                            buy_amount = await trader.get_buy_amount(CHAIN)
-
-                        if buy_amount <= 0:
-                            logger.warning("Insufficient balance to buy %s", token["symbol"])
-                            continue
-
-                        await notifier.notify_new_token(token, buy_amount, native)
-
-                        if DRY_RUN:
-                            logger.info("[DRY_RUN] Would buy %s for %.4f %s", token["symbol"], buy_amount, native)
-                            continue
-
-                        if CHAIN.upper() == "SOL":
-                            result = await trader.buy_token(token["contract_address"], buy_amount)
-                        else:
-                            result = await trader.buy_token(token["contract_address"], CHAIN, buy_amount)
-
-                        if result is None:
-                            logger.error("Buy failed for %s", token["symbol"])
-                            await notifier.notify_error(f"Buy failed for {token['symbol']}")
-                            continue
-
-                        position = {
-                            "token_address": token["contract_address"],
-                            "token_symbol": token["symbol"],
-                            "chain": CHAIN.upper(),
-                            "entry_price": result["entry_price"],
-                            "tokens_received": result["tokens_received"],
-                            "buy_amount_native": result["amount_spent"],
-                            "buy_tx_hash": result["tx_hash"],
-                            "pair_address": token.get("pair_address", ""),
-                        }
-                        await db.save_open_position(position)
-
-                        await notifier.notify_buy_executed(
-                            symbol=token["symbol"],
-                            tokens_received=result["tokens_received"],
-                            entry_price=result["entry_price"],
-                            tx_hash=result["tx_hash"],
-                            chain=CHAIN.upper(),
+                    open_positions = await db.get_open_positions()
+                    if len(open_positions) >= MAX_POSITIONS:
+                        logger.warning(
+                            "Max positions (%d) reached \u2014 skipping %s",
+                            MAX_POSITIONS, token["symbol"],
                         )
+                        break
 
-                    except Exception as exc:
-                        logger.error("Error processing token %s: %s", token.get("symbol"), exc)
+                    if CHAIN.upper() == "SOL":
+                        buy_amount = await trader.get_buy_amount()
+                    else:
+                        buy_amount = await trader.get_buy_amount(CHAIN)
+
+                    if buy_amount <= 0:
+                        logger.warning("Insufficient balance to buy %s", token["symbol"])
+                        continue
+
+                    await notifier.notify_new_token(token, buy_amount, native)
+
+                    if DRY_RUN:
+                        logger.info("[DRY_RUN] Would buy %s for %.4f %s", token["symbol"], buy_amount, native)
+                        continue
+
+                    if CHAIN.upper() == "SOL":
+                        result = await trader.buy_token(token["contract_address"], buy_amount)
+                    else:
+                        result = await trader.buy_token(token["contract_address"], CHAIN, buy_amount)
+
+                    if result is None:
+                        logger.error("Buy failed for %s", token["symbol"])
+                        await notifier.notify_error(f"Buy failed for {token['symbol']}")
+                        continue
+
+                    position = {
+                        "token_address": token["contract_address"],
+                        "token_symbol": token["symbol"],
+                        "chain": CHAIN.upper(),
+                        "entry_price": result["entry_price"],
+                        "tokens_received": result["tokens_received"],
+                        "buy_amount_native": result["amount_spent"],
+                        "buy_tx_hash": result["tx_hash"],
+                        "pair_address": token.get("pair_address", ""),
+                    }
+                    await db.save_open_position(position)
+
+                    await notifier.notify_buy_executed(
+                        symbol=token["symbol"],
+                        tokens_received=result["tokens_received"],
+                        entry_price=result["entry_price"],
+                        tx_hash=result["tx_hash"],
+                        chain=CHAIN.upper(),
+                    )
+
+                except Exception as exc:
+                    logger.error("Error processing token %s: %s", token.get("symbol"), exc)
 
         except Exception as exc:
             logger.error("Scanner error: %s", exc)
 
         await asyncio.sleep(SCAN_INTERVAL)
+
+
+async def alert_check_loop():
+    logger.info("Price alert checker started (interval=%ds)", MONITOR_INTERVAL)
+    while is_running:
+        try:
+            alerts = await db.get_active_alerts()
+            if alerts:
+                for alert in alerts:
+                    try:
+                        token_address = alert["token_address"]
+                        chain = alert["chain"]
+                        if chain.upper() == "SOL":
+                            current_price = await trader.get_token_price_via_jupiter(token_address)
+                        else:
+                            current_price = await trader.get_token_price_onchain(token_address, chain)
+                        if current_price <= 0:
+                            continue
+                        target = alert["target_price"]
+                        direction = alert["direction"]
+                        triggered = False
+                        if direction == "above" and current_price >= target:
+                            triggered = True
+                        elif direction == "below" and current_price <= target:
+                            triggered = True
+                        if triggered:
+                            await db.trigger_alert(alert["id"])
+                            native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
+                            arrow = "\U0001f4c8" if direction == "above" else "\U0001f4c9"
+                            await notifier.send_message(
+                                f"{arrow} <b>Price Alert Triggered</b>\n\n"
+                                f"<b>{alert['token_symbol']}</b> is now {direction} target\n"
+                                f"Target: {target:.10f} {native}\n"
+                                f"Current: {current_price:.10f} {native}\n"
+                                f"Address: <code>{token_address[:20]}...</code>"
+                            )
+                            logger.info("Alert triggered: %s %s %.10f (current %.10f)", alert["token_symbol"], direction, target, current_price)
+                    except Exception as exc:
+                        logger.debug("Alert check error for %s: %s", alert.get("token_symbol"), exc)
+        except Exception as exc:
+            logger.error("Alert loop error: %s", exc)
+        await asyncio.sleep(MONITOR_INTERVAL)
 
 
 async def cmd_help(update, context):
@@ -164,6 +210,9 @@ async def cmd_help(update, context):
         lines.append("/buy &lt;address&gt; [amount] \u2014 Manual buy (DCA if already held)")
         lines.append("/sell &lt;address&gt; [percent] \u2014 Manual sell")
         lines.append("/portfolio \u2014 Full portfolio overview with PnL")
+        lines.append("/alert &lt;address&gt; &lt;above|below&gt; &lt;price&gt; \u2014 Set price alert")
+        lines.append("/alerts \u2014 View active price alerts")
+        lines.append("/export \u2014 Export trade history as CSV")
         if is_admin:
             lines.append("\n<b>Admin only:</b>")
             lines.append("/start \u2014 Start scanning and trading")
@@ -184,7 +233,7 @@ async def cmd_start(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task
+    global is_running, scanner_task, monitor_task, alert_task
 
     if is_running:
         await update.message.reply_text("Bot is already running.")
@@ -193,6 +242,7 @@ async def cmd_start(update, context):
     is_running = True
     scanner_task = asyncio.create_task(scanner_loop())
     monitor_task = asyncio.create_task(monitor.start())
+    alert_task = asyncio.create_task(alert_check_loop())
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     if CHAIN.upper() == "SOL":
@@ -223,7 +273,7 @@ async def cmd_stop(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task
+    global is_running, scanner_task, monitor_task, alert_task
 
     if not is_running:
         await update.message.reply_text("Bot is not running.")
@@ -232,13 +282,13 @@ async def cmd_stop(update, context):
     is_running = False
     if monitor:
         await monitor.stop()
-    if scanner_task and not scanner_task.done():
-        scanner_task.cancel()
-    if monitor_task and not monitor_task.done():
-        monitor_task.cancel()
+    for task in (scanner_task, monitor_task, alert_task):
+        if task and not task.done():
+            task.cancel()
 
     scanner_task = None
     monitor_task = None
+    alert_task = None
 
     await update.message.reply_html("\U0001f6d1 <b>Bot Stopped</b>\nScanning and trading paused. Bot still responds to commands.")
     logger.info("Bot stopped by user %s", update.effective_user.id)
@@ -384,8 +434,7 @@ async def cmd_buy(update, context):
     existing = await db.get_open_position(token_address, CHAIN.upper())
     is_dca = existing is not None
 
-    async with aiohttp.ClientSession() as hp_session:
-        hp = await check_honeypot(hp_session, CHAIN, token_address)
+    hp = await check_honeypot(http_session, CHAIN, token_address)
     if hp["is_honeypot"]:
         await update.message.reply_html(
             "\U0001f6ab <b>Honeypot Detected</b>\n\n"
@@ -463,16 +512,33 @@ async def cmd_sell(update, context):
         return
 
     if not context.args or len(context.args) < 1:
-        await update.message.reply_html(
-            "Usage: <code>/sell &lt;token_address&gt; [percent]</code>\n"
-            "Example: <code>/sell So1abc...xyz 50</code> (sell 50%)\n"
-            "If percent is omitted, sells 100% of holdings."
-        )
+        positions = await db.get_open_positions()
+        if positions:
+            buttons = []
+            for pos in positions:
+                addr = pos["token_address"]
+                sym = pos["token_symbol"]
+                short_addr = addr[:6] + "..." + addr[-4:]
+                buttons.append([
+                    InlineKeyboardButton(f"25% {sym}", callback_data=f"sell:{addr}:25"),
+                    InlineKeyboardButton(f"50% {sym}", callback_data=f"sell:{addr}:50"),
+                    InlineKeyboardButton(f"100% {sym}", callback_data=f"sell:{addr}:100"),
+                ])
+            await update.message.reply_html(
+                "\U0001f4b1 <b>Quick Sell</b>\n\n"
+                "Tap a button to sell, or use:\n"
+                "<code>/sell &lt;token_address&gt; [percent]</code>",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        else:
+            await update.message.reply_html(
+                "Usage: <code>/sell &lt;token_address&gt; [percent]</code>\n"
+                "Example: <code>/sell So1abc...xyz 50</code> (sell 50%)\n"
+                "If percent is omitted, sells 100% of holdings."
+            )
         return
 
     token_address = context.args[0].strip()
-    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-
     sell_percent = 100
     if len(context.args) >= 2:
         try:
@@ -484,13 +550,19 @@ async def cmd_sell(update, context):
             await update.message.reply_text("Invalid percent. Must be a number.")
             return
 
+    await _execute_sell(update.message, token_address, sell_percent)
+
+
+async def _execute_sell(message, token_address: str, sell_percent: float):
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
     if CHAIN.upper() == "SOL":
         ui_balance, decimals = await trader.get_token_balance(token_address)
     else:
         ui_balance, decimals = await trader.get_token_balance(token_address, CHAIN)
 
     if ui_balance <= 0:
-        await update.message.reply_text("No tokens to sell \u2014 zero balance.")
+        await message.reply_text("No tokens to sell \u2014 zero balance.")
         return
 
     sell_ui = ui_balance * (sell_percent / 100)
@@ -500,11 +572,11 @@ async def cmd_sell(update, context):
         sell_raw = int(sell_ui * 1e9)
 
     if sell_raw <= 0:
-        await update.message.reply_text("Amount too small to sell.")
+        await message.reply_text("Amount too small to sell.")
         return
 
     if DRY_RUN:
-        await update.message.reply_html(
+        await message.reply_html(
             f"\U0001f4dd <b>[DRY RUN] Manual Sell</b>\n"
             f"Token: <code>{token_address}</code>\n"
             f"Would sell: {sell_percent}% ({sell_ui:.4f} tokens)\n"
@@ -512,7 +584,7 @@ async def cmd_sell(update, context):
         )
         return
 
-    await update.message.reply_html(
+    await message.reply_html(
         f"\U0001f504 <b>Manual Sell</b>\n"
         f"Token: <code>{token_address}</code>\n"
         f"Selling: {sell_percent}% ({sell_ui:.4f} tokens)\n"
@@ -525,7 +597,7 @@ async def cmd_sell(update, context):
         result = await trader.sell_token(token_address, CHAIN, sell_raw, decimals)
 
     if result is None:
-        await update.message.reply_html("\u274c <b>Sell failed.</b> Check logs for details.")
+        await message.reply_html("\u274c <b>Sell failed.</b> Check logs for details.")
         logger.error("Manual sell failed for %s", token_address)
         return
 
@@ -558,11 +630,17 @@ async def cmd_sell(update, context):
                 }
                 await db.close_position(pos["token_address"], CHAIN.upper(), exit_data)
                 break
+    else:
+        positions = await db.get_open_positions()
+        for pos in positions:
+            if pos["token_address"].lower() == token_address.lower() and pos["chain"] == CHAIN.upper():
+                await db.reduce_position(pos["token_address"], CHAIN.upper(), sell_percent / 100)
+                break
 
     tx_url = EXPLORER_TX.get(CHAIN.upper(), EXPLORER_TX["SOL"]).format(result["tx_hash"])
     short_hash = result["tx_hash"][:10] + "\u2026" + result["tx_hash"][-6:] if len(result["tx_hash"]) > 20 else result["tx_hash"]
 
-    await update.message.reply_html(
+    await message.reply_html(
         f"\u2705 <b>Sell Executed</b>\n"
         f"Token: <code>{token_address[:16]}...</code>\n"
         f"Sold: {sell_percent}% ({sell_ui:.4f} tokens)\n"
@@ -571,6 +649,29 @@ async def cmd_sell(update, context):
     )
 
     logger.info("Manual sell executed: %s (%d%%), tx=%s", token_address, sell_percent, result["tx_hash"])
+
+
+async def callback_sell(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != TELEGRAM_CHAT_ID:
+        await query.edit_message_text("Admin only.")
+        return
+
+    data = query.data
+    if not data.startswith("sell:"):
+        return
+
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+
+    token_address = parts[1]
+    sell_percent = float(parts[2])
+
+    await query.edit_message_text(f"\U0001f504 Selling {sell_percent:.0f}% of {token_address[:12]}...")
+    await _execute_sell(query.message, token_address, sell_percent)
 
 
 async def cmd_portfolio(update, context):
@@ -685,6 +786,141 @@ async def cmd_portfolio(update, context):
     await update.message.reply_html("\n".join(msg_parts))
 
 
+async def cmd_alert(update, context):
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    if not context.args or len(context.args) < 3:
+        await update.message.reply_html(
+            "Usage: <code>/alert &lt;token_address&gt; &lt;above|below&gt; &lt;price&gt;</code>\n"
+            "Example: <code>/alert So1abc...xyz above 0.00001</code>\n"
+            "Sets a notification when the native-token price crosses the target."
+        )
+        return
+
+    token_address = context.args[0].strip()
+    direction = context.args[1].strip().lower()
+    if direction not in ("above", "below"):
+        await update.message.reply_text("Direction must be 'above' or 'below'.")
+        return
+
+    try:
+        target_price = float(context.args[2])
+        if target_price <= 0:
+            await update.message.reply_text("Price must be positive.")
+            return
+    except ValueError:
+        await update.message.reply_text("Invalid price. Must be a number.")
+        return
+
+    pos = await db.get_open_position(token_address, CHAIN.upper())
+    symbol = pos["token_symbol"] if pos else token_address[:8]
+
+    await db.save_price_alert(token_address, symbol, CHAIN.upper(), target_price, direction)
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    arrow = "\U0001f4c8" if direction == "above" else "\U0001f4c9"
+
+    await update.message.reply_html(
+        f"\U0001f514 <b>Alert Set</b>\n\n"
+        f"{arrow} <b>{symbol}</b>\n"
+        f"Trigger: price goes {direction} {target_price:.10f} {native}\n"
+        f"Address: <code>{token_address[:20]}...</code>"
+    )
+
+
+async def cmd_alerts(update, context):
+    if await _reject_unauthorized(update):
+        return
+
+    alerts = await db.get_active_alerts()
+    if not alerts:
+        await update.message.reply_text("No active price alerts.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    lines = ["\U0001f514 <b>Active Price Alerts</b>\n"]
+    for a in alerts:
+        arrow = "\U0001f4c8" if a["direction"] == "above" else "\U0001f4c9"
+        lines.append(
+            f"{arrow} <b>{a['token_symbol']}</b> \u2014 {a['direction']} {a['target_price']:.10f} {native}\n"
+            f"   ID: {a['id']} | <code>/delalert {a['id']}</code>"
+        )
+
+    await update.message.reply_html("\n".join(lines))
+
+
+async def cmd_delalert(update, context):
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_html("Usage: <code>/delalert &lt;alert_id&gt;</code>")
+        return
+
+    try:
+        alert_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid alert ID.")
+        return
+
+    removed = await db.delete_alert(alert_id)
+    if removed:
+        await update.message.reply_html(f"\u2705 Alert #{alert_id} deleted.")
+    else:
+        await update.message.reply_text(f"Alert #{alert_id} not found.")
+
+
+async def cmd_export(update, context):
+    if await _reject_unauthorized(update):
+        return
+
+    trades = await db.get_trade_history(limit=10000)
+    if not trades:
+        await update.message.reply_text("No completed trades to export.")
+        return
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "token_symbol", "token_address", "chain",
+        "entry_price", "exit_price", "tokens_amount",
+        "buy_amount_native", "sell_amount_native",
+        "roi_percent", "duration_seconds",
+        "opened_at", "closed_at",
+        "buy_tx_hash", "sell_tx_hash",
+    ])
+    for t in trades:
+        writer.writerow([
+            t.get("token_symbol", ""),
+            t.get("token_address", ""),
+            t.get("chain", ""),
+            t.get("entry_price", ""),
+            t.get("exit_price", ""),
+            t.get("tokens_amount", ""),
+            t.get("buy_amount_native", ""),
+            t.get("sell_amount_native", ""),
+            t.get("roi_percent", ""),
+            t.get("duration_seconds", ""),
+            t.get("opened_at", ""),
+            t.get("closed_at", ""),
+            t.get("buy_tx_hash", ""),
+            t.get("sell_tx_hash", ""),
+        ])
+
+    buf.seek(0)
+    file_bytes = io.BytesIO(buf.getvalue().encode("utf-8"))
+    file_bytes.name = "trade_history.csv"
+
+    await update.message.reply_document(
+        document=file_bytes,
+        filename="trade_history.csv",
+        caption=f"\U0001f4ca {len(trades)} completed trades exported.",
+    )
+    logger.info("Trade history exported (%d trades) by user %d", len(trades), update.effective_user.id)
+
+
 async def cmd_adduser(update, context):
     if not _is_admin(update):
         await update.message.reply_text("Admin only.")
@@ -746,9 +982,11 @@ async def cmd_users(update, context):
 
 
 async def post_init(application):
-    global trader, monitor, notifier
+    global trader, monitor, notifier, http_session
 
     await db.init_db()
+
+    http_session = aiohttp.ClientSession()
 
     trader = create_trader(CHAIN)
     notifier = Notifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
@@ -770,12 +1008,15 @@ async def post_init(application):
 
 
 async def shutdown(application):
-    global is_running
+    global is_running, http_session
     is_running = False
     if monitor:
         await monitor.stop()
     if trader:
         await trader.close()
+    if http_session and not http_session.closed:
+        await http_session.close()
+        http_session = None
     logger.info("Shutdown complete")
 
 
@@ -800,9 +1041,14 @@ def main():
     app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler("sell", cmd_sell))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
+    app.add_handler(CommandHandler("alert", cmd_alert))
+    app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("delalert", cmd_delalert))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
     app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CallbackQueryHandler(callback_sell, pattern=r"^sell:"))
 
     def _handle_signal(signum, frame):
         logger.info("Received signal %s \u2013 shutting down", signum)

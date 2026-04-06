@@ -106,3 +106,35 @@ def _build_logger() -> logging.Logger:
 
 
 logger = _build_logger()
+
+
+def validate_config():
+    errors = []
+    if STOP_LOSS >= 0:
+        errors.append(f"STOP_LOSS must be negative (got {STOP_LOSS})")
+    if not (1 <= SELL_PERCENT <= 100):
+        errors.append(f"SELL_PERCENT must be 1-100 (got {SELL_PERCENT})")
+    if TAKE_PROFIT <= 0:
+        errors.append(f"TAKE_PROFIT must be > 0 (got {TAKE_PROFIT})")
+    if TRAILING_STOP < 0:
+        errors.append(f"TRAILING_STOP must be >= 0 (got {TRAILING_STOP})")
+    if MAX_POSITIONS < 1:
+        errors.append(f"MAX_POSITIONS must be >= 1 (got {MAX_POSITIONS})")
+    if not (1 <= BUY_PERCENT <= 100):
+        errors.append(f"BUY_PERCENT must be 1-100 (got {BUY_PERCENT})")
+    if not (0 <= MIN_SCORE <= 100):
+        errors.append(f"MIN_SCORE must be 0-100 (got {MIN_SCORE})")
+    if SCAN_INTERVAL <= 0:
+        errors.append(f"SCAN_INTERVAL must be > 0 (got {SCAN_INTERVAL})")
+    if MONITOR_INTERVAL <= 0:
+        errors.append(f"MONITOR_INTERVAL must be > 0 (got {MONITOR_INTERVAL})")
+    if MIN_MCAP >= MAX_MCAP:
+        errors.append(f"MIN_MCAP ({MIN_MCAP}) must be < MAX_MCAP ({MAX_MCAP})")
+    if errors:
+        for e in errors:
+            logger.error("Config error: %s", e)
+        raise EnvironmentError("Invalid configuration:\n  " + "\n  ".join(errors))
+    logger.debug("Config validation passed")
+
+
+validate_config()

@@ -25,6 +25,21 @@ _HEADERS = {
 
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 2
+_rate_limit_count = 0
+
+
+def _record_rate_limit():
+    global _rate_limit_count
+    _rate_limit_count += 1
+
+
+def _reset_rate_limits():
+    global _rate_limit_count
+    _rate_limit_count = 0
+
+
+def get_rate_limit_count() -> int:
+    return _rate_limit_count
 
 
 async def _api_get(session: aiohttp.ClientSession, path: str, params: dict | None = None) -> dict | None:
@@ -37,6 +52,7 @@ async def _api_get(session: aiohttp.ClientSession, path: str, params: dict | Non
                     logger.debug("DexTools API OK %s", path)
                     return data
                 if resp.status == 429:
+                    _record_rate_limit()
                     wait = _BACKOFF_BASE ** attempt
                     logger.warning("Rate-limited on %s – retrying in %ds (attempt %d/%d)", path, wait, attempt, _MAX_RETRIES)
                     await asyncio.sleep(wait)
@@ -330,6 +346,7 @@ async def scan_for_new_tokens(session: aiohttp.ClientSession, chain: str | None 
 
     qualifying: list[dict] = []
     batch_size = 5
+    _reset_rate_limits()
     for i in range(0, len(candidates), batch_size):
         batch = candidates[i : i + batch_size]
         tasks = [_enrich_token(session, chain_id, addr, chain) for addr in batch]
@@ -341,7 +358,12 @@ async def scan_for_new_tokens(session: aiohttp.ClientSession, chain: str | None 
             if result is not None:
                 qualifying.append(result)
         if i + batch_size < len(candidates):
-            await asyncio.sleep(0.5)
+            if get_rate_limit_count() >= 5:
+                backoff = min(30, 5 * (get_rate_limit_count() // 5))
+                logger.warning("Cycle backoff: %d rate limits hit — pausing %ds", get_rate_limit_count(), backoff)
+                await asyncio.sleep(backoff)
+            else:
+                await asyncio.sleep(0.5)
 
     logger.info("Scan complete – %d qualifying tokens found", len(qualifying))
     return qualifying
