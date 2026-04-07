@@ -73,6 +73,7 @@ whale_tracker: WhaleTracker | None = None
 whale_task: asyncio.Task | None = None
 daily_report_task: asyncio.Task | None = None
 is_running: bool = False
+alerts_enabled: bool = False
 _pending_buys: dict[str, str] = {}
 api_runner = None
 
@@ -146,25 +147,26 @@ async def scanner_loop():
                     try:
                         await db.save_detected_token(token)
 
-                        alert_msg = (
-                            "━━━━━━━━━━━━━━━━━━━━━━\n"
-                            "🔍 <b>NEW LOWCAP DETECTED</b>\n"
-                            "━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"🪙 {token.get('name', '?')} ({token.get('symbol', '?')})\n"
-                            f"📄 <code>{token.get('contract_address', '')}</code>\n"
-                            f"⛓ {token.get('chain', '')}\n"
-                            f"💰 MCap: ${token.get('market_cap', 0):,.0f}\n"
-                            f"💧 Liq: ${token.get('liquidity', 0):,.0f}\n"
-                            "━━━━━━━━━━━━━━━━━━━━━━"
-                        )
-                        tp = token.get("contract_address", "")[:16]
-                        alert_markup = InlineKeyboardMarkup([
-                            [
-                                InlineKeyboardButton("🛒 Quick Buy 0.1 SOL", callback_data=f"quickbuy:{tp}:0.1"),
-                                InlineKeyboardButton("🛒 Quick Buy 0.5 SOL", callback_data=f"quickbuy:{tp}:0.5"),
-                            ]
-                        ])
-                        await notifier.broadcast_alert(alert_msg, reply_markup=alert_markup)
+                        if alerts_enabled:
+                            alert_msg = (
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                "🔍 <b>NEW LOWCAP DETECTED</b>\n"
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"🪙 {token.get('name', '?')} ({token.get('symbol', '?')})\n"
+                                f"📄 <code>{token.get('contract_address', '')}</code>\n"
+                                f"⛓ {token.get('chain', '')}\n"
+                                f"💰 MCap: ${token.get('market_cap', 0):,.0f}\n"
+                                f"💧 Liq: ${token.get('liquidity', 0):,.0f}\n"
+                                "━━━━━━━━━━━━━━━━━━━━━━"
+                            )
+                            tp = token.get("contract_address", "")[:16]
+                            alert_markup = InlineKeyboardMarkup([
+                                [
+                                    InlineKeyboardButton("🛒 Quick Buy 0.1 SOL", callback_data=f"quickbuy:{tp}:0.1"),
+                                    InlineKeyboardButton("🛒 Quick Buy 0.5 SOL", callback_data=f"quickbuy:{tp}:0.5"),
+                                ]
+                            ])
+                            await notifier.broadcast_alert(alert_msg, reply_markup=alert_markup)
 
                         trading_users = await db.get_all_trading_users()
                         if not trading_users:
@@ -289,6 +291,7 @@ async def cmd_help(update, context):
         lines.append("/withdraw &lt;amount&gt; &lt;address&gt; — Withdraw SOL")
         lines.append("/export — Export wallet credentials (DM only)")
         lines.append("/stats — Detailed trading performance analytics")
+        lines.append("/lowcaps [count] — Show recent detected tokens")
         if is_admin:
             lines.append("\n<b>Admin only:</b>")
             lines.append("/start — Start scanning and trading")
@@ -305,6 +308,7 @@ async def cmd_help(update, context):
             lines.append("/copytrade — Whale copy trading status")
             lines.append("/fees — Fee revenue stats")
             lines.append("/stats all — All users' combined stats")
+            lines.append("/alerts on|off — Toggle lowcap alert broadcasting")
             lines.append("/backtest [days] — Replay scoring strategy against history")
             from config import API_ENABLED, API_PORT
             lines.append(f"\nAPI: {'Enabled on port ' + str(API_PORT) if API_ENABLED else 'Disabled'}")
@@ -867,6 +871,7 @@ async def cmd_config(update, context):
         f"Anti-Rug Min Liquidity: ${ANTIRUG_MIN_LIQ:,}\n"
         f"Anti-Rug Drop Threshold: {ANTIRUG_LIQ_DROP_PCT}%\n"
         f"Operator Fee: {OPERATOR_FEE_PCT}% ({'Enabled' if OPERATOR_FEE_ENABLED else 'Disabled'})"
+        f"\nAlert Broadcast: {'Enabled' if alerts_enabled else 'Disabled'}"
         f"\nSell Tiers: {SELL_TIERS_RAW if SELL_TIERS_RAW else 'None (full sell at TP)'}"
         f"\n\n<b>Risk Management</b>\n"
         f"Max Positions: {MAX_OPEN_POSITIONS} per user\n"
@@ -1564,9 +1569,12 @@ async def cmd_fees(update, context):
 
 
 async def post_init(application):
-    global trader, monitor, notifier, whale_tracker
+    global trader, monitor, notifier, whale_tracker, alerts_enabled
 
     await db.init_db()
+
+    from config import ALERT_BROADCAST
+    alerts_enabled = ALERT_BROADCAST
 
     trader = create_trader(CHAIN)
     notifier = Notifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
@@ -2338,6 +2346,41 @@ async def handle_callback(update, context):
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
 
+        elif data == "lowcaps_refresh":
+            recent = await db.get_recent_detected_tokens(limit=10)
+            if not recent:
+                await query.edit_message_text("No tokens detected yet.")
+                return
+
+            native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+            lines = [
+                "━━━━━━━━━━━━━━━━━━━━━━",
+                f"🔍 <b>RECENT LOWCAPS</b> (last {len(recent)})",
+                "━━━━━━━━━━━━━━━━━━━━━━",
+            ]
+            keyboard = []
+            for t in recent:
+                lines.append(
+                    f"\n🪙 <b>{t.get('name', '?')}</b> ({t.get('symbol', '?')})\n"
+                    f"   📄 <code>{t.get('contract_address', '')}</code>\n"
+                    f"   💰 MCap: ${t.get('market_cap', 0):,.0f} | 💧 Liq: ${t.get('liquidity', 0):,.0f}\n"
+                    f"   📈 Vol: ${t.get('volume_24h', 0):,.0f} | 🧾 Tax: {t.get('buy_tax', 0):.1f}%/{t.get('sell_tax', 0):.1f}%\n"
+                    f"   🕐 {t.get('detected_at', '?')}"
+                )
+                tp = t.get("contract_address", "")[:16]
+                keyboard.append([
+                    InlineKeyboardButton(f"🛒 Buy 0.1 SOL {t.get('symbol', '?')}", callback_data=f"quickbuy:{tp}:0.1"),
+                    InlineKeyboardButton(f"🛒 Buy 0.5 SOL", callback_data=f"quickbuy:{tp}:0.5"),
+                ])
+            keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="lowcaps_refresh")])
+
+            await query.edit_message_text(
+                "\n".join(lines),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
         elif data == "config_show":
             msg = (
                 "⚙️ <b>Configuration</b>\n\n"
@@ -2356,6 +2399,7 @@ async def handle_callback(update, context):
                 f"Monitor Interval: {MONITOR_INTERVAL}s"
                 f"\nWhale Copy Trade: {'Enabled' if WHALE_COPY_ENABLED else 'Disabled'}"
                 f"\nCopy Amount: {WHALE_COPY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}"
+                f"\nAlert Broadcast: {'Enabled' if alerts_enabled else 'Disabled'}"
                 f"\nSell Tiers: {SELL_TIERS_RAW if SELL_TIERS_RAW else 'None (full sell at TP)'}"
                 f"\n\n<b>Risk Management</b>\n"
                 f"Max Positions: {MAX_OPEN_POSITIONS} per user\n"
@@ -2375,6 +2419,88 @@ async def handle_callback(update, context):
             await query.edit_message_text(f"❌ Error: {str(exc)[:200]}")
         except Exception:
             pass
+
+
+async def cmd_alerts(update, context):
+    """Toggle lowcap alert broadcasting."""
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    global alerts_enabled
+
+    if not context.args:
+        status = "✅ ON" if alerts_enabled else "❌ OFF"
+        await update.message.reply_html(
+            f"📢 <b>Lowcap Alert Broadcast</b>\n\n"
+            f"Status: {status}\n\n"
+            f"Usage: <code>/alerts on</code> or <code>/alerts off</code>\n\n"
+            f"When OFF, the scanner still runs and auto-trades — it just doesn't spam token details to chat.\n"
+            f"Use <code>/lowcaps</code> to see recent detections on demand."
+        )
+        return
+
+    arg = context.args[0].lower()
+    if arg in ("on", "yes", "1", "true"):
+        alerts_enabled = True
+        await update.message.reply_html("📢 Lowcap alerts <b>enabled</b>. New detections will be broadcast to all chats.")
+    elif arg in ("off", "no", "0", "false"):
+        alerts_enabled = False
+        await update.message.reply_html("🔇 Lowcap alerts <b>disabled</b>. Scanner still runs silently. Use /lowcaps to check manually.")
+    else:
+        await update.message.reply_html("Usage: <code>/alerts on|off</code>")
+
+
+async def cmd_lowcaps(update, context):
+    """Show recently detected lowcap tokens on demand."""
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    limit = 10
+    if context.args:
+        try:
+            limit = int(context.args[0])
+            limit = max(1, min(limit, 25))
+        except ValueError:
+            pass
+
+    recent = await db.get_recent_detected_tokens(limit=limit)
+
+    if not recent:
+        await update.message.reply_text("No tokens detected yet. Start the scanner with /start.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"🔍 <b>RECENT LOWCAPS</b> (last {len(recent)})",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    keyboard = []
+    for t in recent:
+        score = t.get("score", "?")
+        lines.append(
+            f"\n🪙 <b>{t.get('name', '?')}</b> ({t.get('symbol', '?')})\n"
+            f"   📄 <code>{t.get('contract_address', '')}</code>\n"
+            f"   💰 MCap: ${t.get('market_cap', 0):,.0f} | 💧 Liq: ${t.get('liquidity', 0):,.0f}\n"
+            f"   📈 Vol: ${t.get('volume_24h', 0):,.0f} | 🧾 Tax: {t.get('buy_tax', 0):.1f}%/{t.get('sell_tax', 0):.1f}%\n"
+            f"   🕐 {t.get('detected_at', '?')}"
+        )
+        tp = t.get("contract_address", "")[:16]
+        keyboard.append([
+            InlineKeyboardButton(f"🛒 Buy 0.1 SOL {t.get('symbol', '?')}", callback_data=f"quickbuy:{tp}:0.1"),
+            InlineKeyboardButton(f"🛒 Buy 0.5 SOL", callback_data=f"quickbuy:{tp}:0.5"),
+        ])
+
+    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="lowcaps_refresh")])
+
+    await update.message.reply_html(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def cmd_backtest(update, context):
@@ -2480,6 +2606,8 @@ def main():
     app.add_handler(CommandHandler("copytrade", cmd_copytrade))
     app.add_handler(CommandHandler("fees", cmd_fees))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("lowcaps", cmd_lowcaps))
     app.add_handler(CommandHandler("backtest", cmd_backtest))
     app.add_handler(CallbackQueryHandler(handle_callback))
 

@@ -1036,3 +1036,15 @@ async def get_backtest_data(days: int = 7) -> dict:
         "trade_outcomes": trade_outcomes,
         "simulations": simulations,
     }
+
+
+async def get_recent_detected_tokens(limit: int = 10) -> list[dict]:
+    """Get most recently detected tokens."""
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM detected_tokens ORDER BY detected_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
