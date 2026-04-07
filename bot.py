@@ -49,6 +49,8 @@ from config import (
     MAX_DAILY_LOSS,
     MAX_BUY_AMOUNT,
     SELL_TIERS_RAW,
+    API_ENABLED,
+    API_PORT,
     logger,
 )
 from crypto_utils import encrypt_key, decrypt_key
@@ -60,6 +62,7 @@ from scanner import scan_all_sources
 from trader import create_trader, create_user_trader, _load_solana_keypair, _get_shared_client
 from whale_tracker import WhaleTracker
 from config import WHALE_TRACKING_ENABLED, WHALE_CHECK_INTERVAL, WHALE_MIN_SOL, WHALE_COPY_ENABLED, WHALE_COPY_AMOUNT
+from api import start_api_server, stop_api_server
 
 trader = None
 monitor: ProfitMonitor | None = None
@@ -71,6 +74,7 @@ whale_task: asyncio.Task | None = None
 daily_report_task: asyncio.Task | None = None
 is_running: bool = False
 _pending_buys: dict[str, str] = {}
+api_runner = None
 
 
 def _is_admin(update) -> bool:
@@ -302,6 +306,8 @@ async def cmd_help(update, context):
             lines.append("/fees — Fee revenue stats")
             lines.append("/stats all — All users' combined stats")
             lines.append("/backtest [days] — Replay scoring strategy against history")
+            from config import API_ENABLED, API_PORT
+            lines.append(f"\nAPI: {'Enabled on port ' + str(API_PORT) if API_ENABLED else 'Disabled'}")
     else:
         uid = update.effective_user.id
         lines.append(f"Your user ID: <code>{uid}</code>")
@@ -866,6 +872,8 @@ async def cmd_config(update, context):
         f"Max Positions: {MAX_OPEN_POSITIONS} per user\n"
         f"Max Daily Loss: {MAX_DAILY_LOSS} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}\n"
         f"Max Buy Amount: {MAX_BUY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}"
+        f"\n\n<b>External API</b>\n"
+        f"API Server: {'Enabled (port ' + str(API_PORT) + ')' if API_ENABLED else 'Disabled'}"
     )
     await update.message.reply_html(msg)
 
@@ -1585,6 +1593,9 @@ async def post_init(application):
 
     trading_users = await db.get_all_trading_users()
 
+    global api_runner
+    api_runner = await start_api_server()
+
     logger.info("Bot initialised – chain=%s, balance=%.6f %s, traders=%d", CHAIN, balance, native, len(trading_users))
     scanner_mode = "DexTools + DexScreener" if DEXTOOLS_API_KEY else "DexScreener only (free)"
     await notifier.send_message(
@@ -1597,8 +1608,10 @@ async def post_init(application):
 
 
 async def shutdown(application):
-    global is_running
+    global is_running, api_runner
     is_running = False
+    await stop_api_server(api_runner)
+    api_runner = None
     if whale_tracker:
         await whale_tracker.stop()
     if monitor:
@@ -2348,6 +2361,8 @@ async def handle_callback(update, context):
                 f"Max Positions: {MAX_OPEN_POSITIONS} per user\n"
                 f"Max Daily Loss: {MAX_DAILY_LOSS} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}\n"
                 f"Max Buy Amount: {MAX_BUY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}"
+                f"\n\n<b>External API</b>\n"
+                f"API Server: {'Enabled (port ' + str(API_PORT) + ')' if API_ENABLED else 'Disabled'}"
             )
             await query.edit_message_text(msg, parse_mode="HTML")
 
