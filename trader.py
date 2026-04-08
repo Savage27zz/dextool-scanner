@@ -306,90 +306,102 @@ class SolanaTrader:
         return await self._get_price_via_jupiter_api(token_mint)
 
     async def buy_token(self, token_mint: str, amount_sol: float) -> dict | None:
-        try:
-            amount_lamports = int(amount_sol * 1e9)
-            slippage_bps = SLIPPAGE * 100
+        last_error = None
+        for attempt in range(2):
+            try:
+                if attempt > 0:
+                    logger.info("Retrying buy for %s (attempt %d)", token_mint, attempt + 1)
+                    await asyncio.sleep(2)
 
-            async with aiohttp.ClientSession() as session:
-                quote_params = {
-                    "inputMint": WSOL_MINT,
-                    "outputMint": token_mint,
-                    "amount": str(amount_lamports),
-                    "slippageBps": str(slippage_bps),
-                }
-                async with session.get(JUPITER_QUOTE_URL, params=quote_params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.error("Jupiter quote failed %d: %s", resp.status, body[:300])
+                amount_lamports = int(amount_sol * 1e9)
+                slippage_bps = SLIPPAGE * 100
+
+                async with aiohttp.ClientSession() as session:
+                    quote_params = {
+                        "inputMint": WSOL_MINT,
+                        "outputMint": token_mint,
+                        "amount": str(amount_lamports),
+                        "slippageBps": str(slippage_bps),
+                    }
+                    async with session.get(JUPITER_QUOTE_URL, params=quote_params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            logger.error("Jupiter quote failed %d: %s", resp.status, body[:300])
+                            return None
+                        quote = await resp.json()
+
+                    if "error" in quote:
+                        logger.error("Jupiter quote error: %s", quote["error"])
                         return None
-                    quote = await resp.json()
 
-                if "error" in quote:
-                    logger.error("Jupiter quote error: %s", quote["error"])
+                    out_amount = int(quote.get("outAmount", 0))
+                    logger.info("Jupiter quote: %s lamports -> %s token raw", amount_lamports, out_amount)
+
+                    swap_payload = {
+                        "quoteResponse": quote,
+                        "userPublicKey": self.wallet,
+                        "wrapAndUnwrapSol": True,
+                        "dynamicComputeUnitLimit": True,
+                        "prioritizationFeeLamports": "auto",
+                    }
+                    async with session.post(JUPITER_SWAP_URL, json=swap_payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            logger.error("Jupiter swap failed %d: %s", resp.status, body[:300])
+                            return None
+                        swap_data = await resp.json()
+
+                swap_tx_b64 = swap_data.get("swapTransaction")
+                if not swap_tx_b64:
+                    logger.error("No swapTransaction in Jupiter response")
                     return None
 
-                out_amount = int(quote.get("outAmount", 0))
-                logger.info("Jupiter quote: %s lamports -> %s token raw", amount_lamports, out_amount)
+                raw_tx = base64.b64decode(swap_tx_b64)
+                tx = VersionedTransaction.from_bytes(raw_tx)
+                signed_tx = VersionedTransaction(tx.message, [self.keypair])
 
-                swap_payload = {
-                    "quoteResponse": quote,
-                    "userPublicKey": self.wallet,
-                    "wrapAndUnwrapSol": True,
-                    "dynamicComputeUnitLimit": True,
-                    "prioritizationFeeLamports": "auto",
+                send_resp = await self.client.send_raw_transaction(
+                    bytes(signed_tx),
+                    opts=TxOpts(skip_preflight=True, max_retries=3),
+                )
+
+                signature = str(send_resp.value)
+                logger.info("Buy tx sent: %s", signature)
+
+                await self._confirm_transaction(signature)
+
+                decimals = 0
+                try:
+                    _, decimals = await self.get_token_balance(token_mint)
+                except Exception:
+                    decimals = 9
+
+                tokens_received = out_amount / (10**decimals) if decimals > 0 else out_amount / 1e9
+                entry_price = amount_sol / tokens_received if tokens_received > 0 else 0
+
+                logger.info(
+                    "Buy SUCCESS: %.4f tokens of %s at price %f SOL, sig %s",
+                    tokens_received, token_mint, entry_price, signature,
+                )
+
+                return {
+                    "tx_hash": signature,
+                    "tokens_received": tokens_received,
+                    "tokens_received_raw": out_amount,
+                    "entry_price": entry_price,
+                    "amount_spent": amount_sol,
+                    "decimals": decimals,
                 }
-                async with session.post(JUPITER_SWAP_URL, json=swap_payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.error("Jupiter swap failed %d: %s", resp.status, body[:300])
-                        return None
-                    swap_data = await resp.json()
 
-            swap_tx_b64 = swap_data.get("swapTransaction")
-            if not swap_tx_b64:
-                logger.error("No swapTransaction in Jupiter response")
+            except Exception as exc:
+                last_error = exc
+                logger.error("buy_token error for %s (attempt %d): %s", token_mint, attempt + 1, exc)
+                if attempt == 0:
+                    continue
                 return None
 
-            raw_tx = base64.b64decode(swap_tx_b64)
-            tx = VersionedTransaction.from_bytes(raw_tx)
-            signed_tx = VersionedTransaction(tx.message, [self.keypair])
-
-            send_resp = await self.client.send_raw_transaction(
-                bytes(signed_tx),
-                opts=TxOpts(skip_preflight=True, max_retries=3),
-            )
-
-            signature = str(send_resp.value)
-            logger.info("Buy tx sent: %s", signature)
-
-            await self._confirm_transaction(signature)
-
-            decimals = 0
-            try:
-                _, decimals = await self.get_token_balance(token_mint)
-            except Exception:
-                decimals = 9
-
-            tokens_received = out_amount / (10**decimals) if decimals > 0 else out_amount / 1e9
-            entry_price = amount_sol / tokens_received if tokens_received > 0 else 0
-
-            logger.info(
-                "Buy SUCCESS: %.4f tokens of %s at price %f SOL, sig %s",
-                tokens_received, token_mint, entry_price, signature,
-            )
-
-            return {
-                "tx_hash": signature,
-                "tokens_received": tokens_received,
-                "tokens_received_raw": out_amount,
-                "entry_price": entry_price,
-                "amount_spent": amount_sol,
-                "decimals": decimals,
-            }
-
-        except Exception as exc:
-            logger.error("buy_token error for %s: %s", token_mint, exc)
-            return None
+        logger.error("buy_token failed after retries for %s: %s", token_mint, last_error)
+        return None
 
     async def sell_token(self, token_mint: str, token_amount_raw: int, decimals: int = 9) -> dict | None:
         try:

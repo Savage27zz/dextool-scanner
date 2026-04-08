@@ -194,6 +194,7 @@ async def _enrich_token(session: aiohttp.ClientSession, chain_id: str, address: 
         if is_honeypot or sell_tax > 50:
             logger.info("Skipping honeypot token %s (%s) — sell_tax=%.1f%%", symbol, address, sell_tax)
             return None
+        hp_safety = await check_honeypot(session, chain, address)
     else:
         hp = await check_honeypot(session, chain, address)
         if hp["is_honeypot"]:
@@ -201,6 +202,7 @@ async def _enrich_token(session: aiohttp.ClientSession, chain_id: str, address: 
             return None
         buy_tax = hp["buy_tax"]
         sell_tax = hp["sell_tax"]
+        hp_safety = hp
 
     pair_address = ""
     liquidity = 0.0
@@ -299,6 +301,15 @@ async def _enrich_token(session: aiohttp.ClientSession, chain_id: str, address: 
         "deployer_wallet": deployer_wallet,
         "social_links": social_links,
         "pair_address": pair_address,
+        "is_mintable": hp_safety.get("is_mintable", False),
+        "is_proxy": hp_safety.get("is_proxy", False),
+        "owner_change_balance": hp_safety.get("owner_change_balance", False),
+        "can_take_back_ownership": hp_safety.get("can_take_back_ownership", False),
+        "top_holder_percent": hp_safety.get("top_holder_percent", 0),
+        "holder_count": hp_safety.get("holder_count", 0) or holders,
+        "lp_locked": hp_safety.get("lp_locked", False),
+        "checked": hp_safety.get("checked", False),
+        "goplus_checked": hp_safety.get("goplus_checked", False),
     }
 
 
