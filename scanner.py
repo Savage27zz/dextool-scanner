@@ -309,6 +309,7 @@ async def _enrich_token(session: aiohttp.ClientSession, chain_id: str, address: 
         "holder_count": hp_safety.get("holder_count", 0) or holders,
         "lp_locked": hp_safety.get("lp_locked", False),
         "checked": hp_safety.get("checked", False),
+        "goplus_checked": hp_safety.get("goplus_checked", False),
     }
 
 

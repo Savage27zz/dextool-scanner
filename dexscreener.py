@@ -203,6 +203,7 @@ async def _enrich_from_dexscreener(
         "holder_count": hp_result.get("holder_count", 0),
         "lp_locked": hp_result.get("lp_locked", False),
         "checked": hp_result.get("checked", False),
+        "goplus_checked": hp_result.get("goplus_checked", False),
     }
 
 

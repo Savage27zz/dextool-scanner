@@ -168,10 +168,8 @@ def score_token(token: dict) -> dict:
     if token.get("lp_locked", False):
         safety_score += 3
 
-    has_goplus_data = any(token.get(k) is not None and token.get(k) is not False for k in
-                         ["is_mintable", "is_proxy", "owner_change_balance", "lp_locked"])
-    if not has_goplus_data and not token.get("checked", False):
-        safety_score = 5
+    if not token.get("goplus_checked", False):
+        safety_score = 5  # no GoPlus data — neutral score
 
     breakdown["contract_safety"] = safety_score
 

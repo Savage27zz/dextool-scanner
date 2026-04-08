@@ -33,6 +33,7 @@ _RESULT_UNKNOWN = {
     "holder_count": 0,
     "lp_locked": False,
     "lp_holder_count": 0,
+    "goplus_checked": False,
 }
 
 
@@ -76,6 +77,7 @@ async def _check_dextools(session: aiohttp.ClientSession, chain: str, address: s
         "can_take_back_ownership": False, "owner_change_balance": False,
         "creator_percent": 0.0, "owner_percent": 0.0, "top_holder_percent": 0.0,
         "holder_count": 0, "lp_locked": False, "lp_holder_count": 0,
+        "goplus_checked": False,
     }
 
 
@@ -174,6 +176,7 @@ async def _check_goplus(session: aiohttp.ClientSession, chain: str, address: str
         "holder_count": holder_count,
         "lp_locked": lp_locked,
         "lp_holder_count": lp_holder_count,
+        "goplus_checked": True,
     }
 
 
