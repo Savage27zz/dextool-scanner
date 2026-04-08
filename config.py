@@ -66,7 +66,7 @@ ANTIRUG_LIQ_DROP_PCT: int = _env("ANTIRUG_LIQ_DROP_PCT", default="70", cast=int)
 OPERATOR_FEE_PCT: float = _env("OPERATOR_FEE_PCT", default="5", cast=float)
 OPERATOR_FEE_ENABLED: bool = _env("OPERATOR_FEE_ENABLED", default="true", cast=lambda v: v.lower() in ("true", "1", "yes"))
 
-MAX_OPEN_POSITIONS: int = _env("MAX_OPEN_POSITIONS", default="5", cast=int)
+MAX_OPEN_POSITIONS: int = _env("MAX_OPEN_POSITIONS", default="3", cast=int)
 MAX_DAILY_LOSS: float = _env("MAX_DAILY_LOSS", default="2.0", cast=float)  # in native token (SOL/ETH/BNB)
 MAX_BUY_AMOUNT: float = _env("MAX_BUY_AMOUNT", default="1.0", cast=float)  # max per single buy in native token
 
@@ -75,6 +75,10 @@ API_PORT: int = _env("API_PORT", default="8080", cast=int)
 API_KEY: str = _env("API_KEY", default="")
 
 ALERT_BROADCAST: bool = _env("ALERT_BROADCAST", default="false", cast=lambda v: v.lower() in ("true", "1", "yes"))
+
+SNIPER_ENABLED: bool = _env("SNIPER_ENABLED", default="false", cast=lambda v: v.lower() in ("true", "1", "yes"))
+SNIPER_CHECK_INTERVAL: int = _env("SNIPER_CHECK_INTERVAL", default="10", cast=int)
+SNIPER_MIN_LIQUIDITY: int = _env("SNIPER_MIN_LIQUIDITY", default="1000", cast=int)
 
 SELL_TIERS_RAW: str = _env("SELL_TIERS", default="")
 
