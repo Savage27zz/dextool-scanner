@@ -9,6 +9,7 @@ import aiohttp
 import base58
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed
+from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
@@ -314,7 +315,7 @@ class SolanaTrader:
 
             send_resp = await self.client.send_raw_transaction(
                 bytes(signed_tx),
-                opts={"skip_preflight": True, "max_retries": 3},
+                opts=TxOpts(skip_preflight=True, max_retries=3),
             )
 
             signature = str(send_resp.value)
@@ -400,7 +401,7 @@ class SolanaTrader:
 
             send_resp = await self.client.send_raw_transaction(
                 bytes(signed_tx),
-                opts={"skip_preflight": True, "max_retries": 3},
+                opts=TxOpts(skip_preflight=True, max_retries=3),
             )
 
             signature = str(send_resp.value)

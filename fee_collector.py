@@ -1,6 +1,7 @@
 import asyncio
 import time
 
+from solana.rpc.types import TxOpts
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 from solders.system_program import TransferParams, transfer
@@ -71,7 +72,7 @@ async def collect_fee(
 
         resp = await client.send_raw_transaction(
             bytes(tx),
-            opts={"skip_preflight": True, "max_retries": 3},
+            opts=TxOpts(skip_preflight=True, max_retries=3),
         )
         sig = str(resp.value)
 
