@@ -195,6 +195,15 @@ async def _enrich_from_dexscreener(
         "social_links": social_links,
         "pair_address": pair_address,
         "source": "dexscreener",
+        "is_mintable": hp_result.get("is_mintable", False),
+        "is_proxy": hp_result.get("is_proxy", False),
+        "owner_change_balance": hp_result.get("owner_change_balance", False),
+        "can_take_back_ownership": hp_result.get("can_take_back_ownership", False),
+        "top_holder_percent": hp_result.get("top_holder_percent", 0),
+        "holder_count": hp_result.get("holder_count", 0),
+        "lp_locked": hp_result.get("lp_locked", False),
+        "checked": hp_result.get("checked", False),
+        "goplus_checked": hp_result.get("goplus_checked", False),
     }
 
 

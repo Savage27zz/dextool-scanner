@@ -43,14 +43,14 @@ TRAILING_ENABLED: bool = _env("TRAILING_ENABLED", default="true", cast=lambda v:
 TRAILING_DROP: int = _env("TRAILING_DROP", default="10", cast=int)
 SLIPPAGE: int = _env("SLIPPAGE", default="15", cast=int)
 
-MIN_LIQUIDITY: int = _env("MIN_LIQUIDITY", default="5000", cast=int)
+MIN_LIQUIDITY: int = _env("MIN_LIQUIDITY", default="10000", cast=int)
 MAX_MCAP: int = _env("MAX_MCAP", default="500000", cast=int)
 MIN_MCAP: int = _env("MIN_MCAP", default="10000", cast=int)
 
 SCAN_INTERVAL: int = _env("SCAN_INTERVAL", default="60", cast=int)
 MONITOR_INTERVAL: int = _env("MONITOR_INTERVAL", default="30", cast=int)
 
-MIN_SCORE: int = _env("MIN_SCORE", default="40", cast=int)
+MIN_SCORE: int = _env("MIN_SCORE", default="60", cast=int)
 
 WHALE_TRACKING_ENABLED: bool = _env("WHALE_TRACKING_ENABLED", default="true", cast=lambda v: v.lower() in ("true", "1", "yes"))
 WHALE_CHECK_INTERVAL: int = _env("WHALE_CHECK_INTERVAL", default="45", cast=int)
