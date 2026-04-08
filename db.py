@@ -1068,12 +1068,12 @@ async def get_recent_detected_tokens(limit: int = 10) -> list[dict]:
 async def add_snipe_target(token_address: str, user_id: int, amount: float = 0) -> bool:
     try:
         async with aiosqlite.connect(str(DB_PATH)) as db:
-            await db.execute(
+            cursor = await db.execute(
                 "INSERT OR IGNORE INTO snipe_targets (token_address, user_id, amount) VALUES (?, ?, ?)",
                 (token_address, user_id, amount),
             )
             await db.commit()
-        return True
+            return cursor.rowcount > 0
     except Exception:
         return False
 
