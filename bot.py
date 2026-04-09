@@ -80,6 +80,8 @@ _pending_buys: dict[str, str] = {}
 api_runner = None
 sniper: Sniper | None = None
 sniper_task: asyncio.Task | None = None
+dca_task: asyncio.Task | None = None
+limit_order_task: asyncio.Task | None = None
 
 
 def _is_admin(update) -> bool:
@@ -149,6 +151,12 @@ async def scanner_loop():
 
                 for token in tokens:
                     try:
+                        contract = token.get("contract_address", "")
+
+                        if await db.is_blacklisted(contract, CHAIN.upper()):
+                            logger.debug("Skipping blacklisted token %s", token.get("symbol"))
+                            continue
+
                         await db.save_detected_token(token)
 
                         if alerts_enabled:
@@ -188,9 +196,10 @@ async def scanner_loop():
                                 # --- Risk Management Checks ---
                                 # 1. Max open positions
                                 open_count = await db.count_open_positions(uid)
-                                if open_count >= MAX_OPEN_POSITIONS:
+                                user_cfg = await db.get_effective_config(uid)
+                                if open_count >= user_cfg["max_positions"]:
                                     logger.debug("User %d at max positions (%d/%d) — skipping %s",
-                                                 uid, open_count, MAX_OPEN_POSITIONS, token.get("symbol"))
+                                                 uid, open_count, user_cfg["max_positions"], token.get("symbol"))
                                     continue
 
                                 # 2. Daily loss limit
@@ -213,9 +222,16 @@ async def scanner_loop():
                                     continue
 
                                 # 3. Max buy amount cap
-                                if MAX_BUY_AMOUNT > 0 and buy_amount > MAX_BUY_AMOUNT:
-                                    buy_amount = MAX_BUY_AMOUNT
-                                    logger.debug("Capped buy for user %d to %.4f", uid, MAX_BUY_AMOUNT)
+                                if user_cfg["max_buy_amount"] > 0 and buy_amount > user_cfg["max_buy_amount"]:
+                                    buy_amount = user_cfg["max_buy_amount"]
+                                    logger.debug("Capped buy for user %d to %.4f", uid, user_cfg["max_buy_amount"])
+
+                                # 4. Add compound funds if available
+                                compound_funds = await db.get_compound_fund(uid)
+                                if compound_funds > 0.01:
+                                    buy_amount += compound_funds
+                                    await db.deduct_compound_funds(uid, compound_funds)
+                                    logger.info("User %d compound buy: +%.4f %s from fund", uid, compound_funds, native)
 
                                 await notifier.send_to_user(
                                     uid,
@@ -264,6 +280,49 @@ async def scanner_loop():
                     except Exception as exc:
                         logger.error("Error processing token %s: %s", token.get("symbol"), exc)
 
+                whitelist = await db.get_whitelist()
+                for wl_item in whitelist:
+                    wl_addr = wl_item["token_address"]
+                    trading_users = await db.get_all_trading_users()
+                    for user_wallet in trading_users:
+                        uid = user_wallet["user_id"]
+                        try:
+                            already = await db.is_token_already_bought(wl_addr, CHAIN.upper(), uid)
+                            if already:
+                                continue
+                            user_cfg = await db.get_effective_config(uid)
+                            open_count = await db.count_open_positions(uid)
+                            if open_count >= user_cfg["max_positions"]:
+                                continue
+                            user_trader = await create_user_trader(uid)
+                            if user_trader is None:
+                                continue
+                            buy_amount = await user_trader.get_buy_amount()
+                            if buy_amount <= 0:
+                                continue
+                            if user_cfg["max_buy_amount"] > 0 and buy_amount > user_cfg["max_buy_amount"]:
+                                buy_amount = user_cfg["max_buy_amount"]
+
+                            logger.info("Whitelist auto-buy: %s for user %d", wl_addr, uid)
+                            result = await user_trader.buy_token(wl_addr, buy_amount)
+                            if result:
+                                position = {
+                                    "token_address": wl_addr,
+                                    "token_symbol": wl_item.get("label", wl_addr[:8]),
+                                    "chain": CHAIN.upper(),
+                                    "entry_price": result["entry_price"],
+                                    "tokens_received": result["tokens_received"],
+                                    "buy_amount_native": result["amount_spent"],
+                                    "buy_tx_hash": result["tx_hash"],
+                                    "pair_address": "",
+                                    "entry_liquidity": 0,
+                                    "user_id": uid,
+                                }
+                                await db.save_open_position(position)
+                                await notifier.send_to_user(uid, f"\u2705 Whitelist buy: {wl_item.get('label', wl_addr[:8])} \u2014 {result['amount_spent']:.4f} {native}")
+                        except Exception as exc:
+                            logger.error("Whitelist buy error for %s user %d: %s", wl_addr, uid, exc)
+
         except Exception as exc:
             logger.error("Scanner error: %s", exc)
 
@@ -288,7 +347,6 @@ async def cmd_help(update, context):
         lines.append("/balance — Wallet balance")
         lines.append("/history — Last 10 completed trades")
         lines.append("/portfolio — Full portfolio overview with PnL")
-        lines.append("/config — Current bot configuration")
         lines.append("/buy &lt;address&gt; [amount] — Manual buy")
         lines.append("/sell &lt;address&gt; [percent] — Manual sell")
         lines.append("/info &lt;address&gt; — Token research &amp; safety report")
@@ -296,8 +354,15 @@ async def cmd_help(update, context):
         lines.append("/autotrade on|off — Toggle auto-trading")
         lines.append("/withdraw &lt;amount&gt; &lt;address&gt; — Withdraw SOL")
         lines.append("/export — Export wallet credentials (DM only)")
+        lines.append("/sellall — Panic sell all open positions")
         lines.append("/stats — Detailed trading performance analytics")
+        lines.append("/pnl [days] — P&amp;L summary (default: today)")
         lines.append("/lowcaps [count] — Show recent detected tokens")
+        lines.append("")
+        lines.append("<b>⚙️ Settings:</b>")
+        lines.append("/mysettings — View/edit your personal trading settings")
+        lines.append("/compound — Auto-compound settings &amp; fund")
+        lines.append("/config — Current global bot configuration")
         if is_admin:
             lines.append("\n<b>Admin only:</b>")
             lines.append("/start — Start scanning and trading")
@@ -316,6 +381,13 @@ async def cmd_help(update, context):
             lines.append("/stats all — All users' combined stats")
             lines.append("/alerts on|off — Toggle lowcap alert broadcasting")
             lines.append("/backtest [days] — Replay scoring strategy against history")
+            lines.append("/blacklist — Manage token blacklist")
+            lines.append("/whitelist — Manage token whitelist")
+            lines.append("")
+            lines.append("<b>📊 Trading:</b>")
+            lines.append("/dca — Dollar cost averaging (split buys)")
+            lines.append("/limit — Limit orders (buy/sell at price)")
+            lines.append("/orders — View all active orders")
             from config import API_ENABLED, API_PORT
             lines.append(f"\nAPI: {'Enabled on port ' + str(API_PORT) if API_ENABLED else 'Disabled'}")
             lines.append(f"Sniper: {'Enabled' if SNIPER_ENABLED else 'Disabled'}")
@@ -351,7 +423,7 @@ async def cmd_start(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task
+    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task, dca_task, limit_order_task
 
     if is_running:
         await update.message.reply_text("Bot is already running.")
@@ -365,6 +437,8 @@ async def cmd_start(update, context):
     if sniper and SNIPER_ENABLED:
         sniper_task = asyncio.create_task(sniper.start())
     daily_report_task = asyncio.create_task(daily_report_loop())
+    dca_task = asyncio.create_task(dca_loop())
+    limit_order_task = asyncio.create_task(limit_order_loop())
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     if CHAIN.upper() == "SOL":
@@ -393,7 +467,7 @@ async def cmd_stop(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task
+    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task, dca_task, limit_order_task
 
     if not is_running:
         await update.message.reply_text("Bot is not running.")
@@ -416,12 +490,18 @@ async def cmd_stop(update, context):
         sniper_task.cancel()
     if daily_report_task and not daily_report_task.done():
         daily_report_task.cancel()
+    if dca_task and not dca_task.done():
+        dca_task.cancel()
+    if limit_order_task and not limit_order_task.done():
+        limit_order_task.cancel()
 
     scanner_task = None
     monitor_task = None
     whale_task = None
     sniper_task = None
     daily_report_task = None
+    dca_task = None
+    limit_order_task = None
 
     await update.message.reply_html("🛑 <b>Bot Stopped</b>\nScanning and trading paused. Bot still responds to commands.")
     logger.info("Bot stopped by user %s", update.effective_user.id)
@@ -515,26 +595,83 @@ async def cmd_stats(update, context):
 
 
 async def daily_report_loop():
+    global is_running
+    logger.info("Daily PnL loop started")
+
     while is_running:
-        now = datetime.now(timezone.utc)
-        tomorrow = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        wait_seconds = (tomorrow - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
-
-        if not is_running:
-            break
-
         try:
-            native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-            stats = await db.get_trade_stats(days=1)
+            now = datetime.now(timezone.utc)
+            tomorrow = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            wait_seconds = (tomorrow - now).total_seconds()
 
-            if stats["total_trades"] == 0:
-                continue
+            elapsed = 0
+            while elapsed < wait_seconds and is_running:
+                await asyncio.sleep(min(60, wait_seconds - elapsed))
+                elapsed += 60
 
-            await notifier.notify_daily_report(stats, native)
+            if not is_running:
+                break
+
+            await _send_daily_reports()
 
         except Exception as exc:
-            logger.error("Daily report error: %s", exc)
+            logger.error("Daily PnL loop error: %s", exc)
+            await asyncio.sleep(3600)
+
+
+async def _send_daily_reports():
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    trading_users = await db.get_all_trading_users()
+
+    for user_wallet in trading_users:
+        uid = user_wallet["user_id"]
+        try:
+            report = await db.get_daily_pnl_report(uid)
+            if report is None:
+                continue
+
+            balance = 0.0
+            try:
+                user_trader = await create_user_trader(uid)
+                if user_trader:
+                    balance = await user_trader.get_balance()
+            except Exception:
+                pass
+
+            lines = [
+                "━━━━━━━━━━━━━━━━━━━━━━",
+                "📊 <b>DAILY PnL REPORT</b>",
+                "━━━━━━━━━━━━━━━━━━━━━━",
+                f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                "",
+            ]
+
+            if report["trades_today"] > 0:
+                pnl_emoji = "🟢" if report["net_pnl"] >= 0 else "🔴"
+                lines.append(f"<b>Today's Activity:</b>")
+                lines.append(f"  Trades closed: {report['trades_today']}")
+                lines.append(f"  Wins/Losses: {report['wins']}/{report['losses']}")
+                lines.append(f"  Win rate: {report['win_rate']:.0f}%")
+                lines.append(f"  {pnl_emoji} Net P&L: {report['net_pnl']:+.6f} {native}")
+                if report["best_trade"]:
+                    lines.append(f"  🏆 Best: {report['best_trade']['symbol']} ({report['best_trade']['roi']:+.1f}%)")
+                if report["worst_trade"]:
+                    lines.append(f"  💀 Worst: {report['worst_trade']['symbol']} ({report['worst_trade']['roi']:+.1f}%)")
+                lines.append("")
+            else:
+                lines.append("No trades closed today.\n")
+
+            lines.append(f"<b>Open Positions:</b> {report['open_count']}")
+            if report["open_count"] > 0:
+                lines.append(f"  Total invested: {report['total_invested']:.4f} {native}")
+
+            lines.append(f"\n💰 Wallet balance: {balance:.6f} {native}")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+            await notifier.send_to_user(uid, "\n".join(lines))
+
+        except Exception as exc:
+            logger.error("Daily report error for user %d: %s", uid, exc)
 
 
 async def cmd_wallet(update, context):
@@ -896,6 +1033,114 @@ async def cmd_config(update, context):
         f"\nSniper: {'ON' if SNIPER_ENABLED else 'OFF'} | Check: {SNIPER_CHECK_INTERVAL}s | Min Liq: ${SNIPER_MIN_LIQUIDITY:,}\n"
     )
     await update.message.reply_html(msg)
+
+
+_SETTINGS_VALIDATION = {
+    "min_score":     (int,   0,      100),
+    "stop_loss":     (int,  -100,    0),
+    "take_profit":   (int,   1,      1000),
+    "buy_percent":   (int,   1,      100),
+    "trailing_drop": (int,   1,      100),
+    "slippage":      (int,   1,      100),
+    "max_positions": (int,   1,      20),
+    "max_buy_amount":(float, 0.001,  100),
+}
+
+
+async def cmd_mysettings(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    uid = update.effective_user.id
+    args = context.args or []
+
+    if len(args) == 1 and args[0].lower() == "reset":
+        deleted = await db.delete_user_settings(uid)
+        if deleted:
+            await update.message.reply_html("✅ All your settings have been reset to global defaults.")
+        else:
+            await update.message.reply_html("ℹ️ You have no custom settings to reset.")
+        return
+
+    if len(args) >= 2:
+        key = args[0].lower()
+        raw_value = args[1]
+        if key not in _SETTINGS_VALIDATION:
+            valid_keys = ", ".join(sorted(_SETTINGS_VALIDATION))
+            await update.message.reply_html(f"❌ Unknown setting <code>{key}</code>.\nValid keys: <code>{valid_keys}</code>")
+            return
+        cast, lo, hi = _SETTINGS_VALIDATION[key]
+        try:
+            value = cast(raw_value)
+        except (ValueError, TypeError):
+            await update.message.reply_html(f"❌ Invalid value. Expected {cast.__name__} between {lo} and {hi}.")
+            return
+        if value < lo or value > hi:
+            await update.message.reply_html(f"❌ Value out of range. <code>{key}</code> must be between {lo} and {hi}.")
+            return
+        await db.upsert_user_setting(uid, key, value)
+        await update.message.reply_html(f"✅ <code>{key}</code> set to <b>{value}</b>")
+        return
+
+    if args:
+        await update.message.reply_html(
+            "Usage:\n"
+            "<code>/mysettings</code> — view current settings\n"
+            "<code>/mysettings &lt;key&gt; &lt;value&gt;</code> — set a value\n"
+            "<code>/mysettings reset</code> — reset all to defaults"
+        )
+        return
+
+    cfg = await db.get_effective_config(uid)
+    user_row = await db.get_user_settings(uid)
+
+    from config import (
+        MIN_SCORE, STOP_LOSS, TAKE_PROFIT, BUY_PERCENT,
+        TRAILING_DROP, SLIPPAGE, MAX_OPEN_POSITIONS, MAX_BUY_AMOUNT,
+    )
+    global_defaults = {
+        "min_score": MIN_SCORE,
+        "stop_loss": STOP_LOSS,
+        "take_profit": TAKE_PROFIT,
+        "buy_percent": BUY_PERCENT,
+        "trailing_drop": TRAILING_DROP,
+        "slippage": SLIPPAGE,
+        "max_positions": MAX_OPEN_POSITIONS,
+        "max_buy_amount": MAX_BUY_AMOUNT,
+    }
+
+    labels = {
+        "min_score": "Min Score",
+        "stop_loss": "Stop Loss",
+        "take_profit": "Take Profit",
+        "buy_percent": "Buy %",
+        "trailing_drop": "Trailing Drop",
+        "slippage": "Slippage",
+        "max_positions": "Max Positions",
+        "max_buy_amount": "Max Buy Amount",
+    }
+    suffixes = {
+        "stop_loss": "%", "take_profit": "%", "buy_percent": "%",
+        "trailing_drop": "%", "slippage": "%",
+    }
+
+    lines = ["⚙️ <b>Your Settings</b>", "─────────────────"]
+    for key, label in labels.items():
+        val = cfg[key]
+        suffix = suffixes.get(key, "")
+        is_custom = user_row is not None and user_row.get(key) is not None
+        if is_custom:
+            lines.append(f"{label}: <b>{val}{suffix}</b> ✏️  (global: {global_defaults[key]}{suffix})")
+        else:
+            lines.append(f"{label}: {val}{suffix}  <i>(global default)</i>")
+
+    lines.append("")
+    lines.append("<b>Usage:</b> <code>/mysettings &lt;key&gt; &lt;value&gt;</code>")
+    lines.append("<b>Example:</b> <code>/mysettings min_score 70</code>")
+    lines.append("<b>Reset all:</b> <code>/mysettings reset</code>")
+
+    await update.message.reply_html("\n".join(lines))
 
 
 async def cmd_buy(update, context):
@@ -1765,8 +2010,9 @@ async def post_init(application):
 
     await db.init_db()
 
-    from config import ALERT_BROADCAST
+    from config import ALERT_BROADCAST, RPC_URLS_SOL
     alerts_enabled = ALERT_BROADCAST
+    logger.info("Configured %d Solana RPC endpoint(s)", len(RPC_URLS_SOL))
 
     trader = create_trader(CHAIN)
     notifier = Notifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
@@ -1811,7 +2057,7 @@ async def post_init(application):
 
 
 async def shutdown(application):
-    global is_running, api_runner
+    global is_running, api_runner, dca_task, limit_order_task, daily_report_task
     is_running = False
     await stop_api_server(api_runner)
     api_runner = None
@@ -1819,6 +2065,15 @@ async def shutdown(application):
         await whale_tracker.stop()
     if monitor:
         await monitor.stop()
+    if dca_task and not dca_task.done():
+        dca_task.cancel()
+    if limit_order_task and not limit_order_task.done():
+        limit_order_task.cancel()
+    if daily_report_task and not daily_report_task.done():
+        daily_report_task.cancel()
+    dca_task = None
+    limit_order_task = None
+    daily_report_task = None
     if trader:
         await trader.close()
     logger.info("Shutdown complete")
@@ -2832,6 +3087,685 @@ async def cmd_backtest(update, context):
     await update.message.reply_html("\n".join(msg_parts))
 
 
+async def cmd_blacklist(update, context):
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("\U0001f512 Admin only.")
+        return
+
+    if not context.args:
+        items = await db.get_blacklist()
+        if not items:
+            await update.message.reply_text("Blacklist is empty.")
+            return
+        lines = ["\U0001f6ab <b>Token Blacklist</b>\n"]
+        for item in items:
+            lines.append(f"\u2022 <code>{item['token_address'][:12]}\u2026</code> {item.get('reason', '')}")
+        await update.message.reply_html("\n".join(lines))
+        return
+
+    if context.args[0].lower() == "remove" and len(context.args) >= 2:
+        removed = await db.remove_from_blacklist(context.args[1], CHAIN.upper())
+        msg = "\u2705 Removed from blacklist." if removed else "Not found in blacklist."
+        await update.message.reply_text(msg)
+        return
+
+    token_addr = context.args[0]
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+    added = await db.add_to_blacklist(token_addr, CHAIN.upper(), reason, update.effective_user.id)
+    msg = "\U0001f6ab Added to blacklist." if added else "Already blacklisted."
+    await update.message.reply_text(msg)
+
+
+async def cmd_whitelist(update, context):
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("\U0001f512 Admin only.")
+        return
+
+    if not context.args:
+        items = await db.get_whitelist()
+        if not items:
+            await update.message.reply_text("Whitelist is empty.")
+            return
+        lines = ["\u2705 <b>Token Whitelist</b>\n"]
+        for item in items:
+            lines.append(f"\u2022 <code>{item['token_address'][:12]}\u2026</code> {item.get('label', '')}")
+        await update.message.reply_html("\n".join(lines))
+        return
+
+    if context.args[0].lower() == "remove" and len(context.args) >= 2:
+        removed = await db.remove_from_whitelist(context.args[1], CHAIN.upper())
+        msg = "\u2705 Removed from whitelist." if removed else "Not found in whitelist."
+        await update.message.reply_text(msg)
+        return
+
+    token_addr = context.args[0]
+    label = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+    added = await db.add_to_whitelist(token_addr, CHAIN.upper(), label, update.effective_user.id)
+    msg = "\u2705 Added to whitelist." if added else "Already whitelisted."
+    await update.message.reply_text(msg)
+
+
+async def cmd_sellall(update, context):
+    """Dump all open positions immediately."""
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    user_trader = await create_user_trader(user_id)
+    if user_trader is None:
+        await update.message.reply_text("No wallet found.")
+        return
+
+    positions = await db.get_open_positions(user_id=user_id)
+    if not positions:
+        await update.message.reply_text("No open positions to sell.")
+        return
+
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.message.reply_html(
+            f"\u26a0\ufe0f <b>PANIC SELL</b>\n\n"
+            f"This will sell ALL {len(positions)} open position(s) at market price.\n\n"
+            f"To confirm: <code>/sellall confirm</code>"
+        )
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    await update.message.reply_html(f"\U0001f534 <b>Selling all {len(positions)} positions...</b>")
+
+    sold = 0
+    failed = 0
+    total_received = 0.0
+
+    for pos in positions:
+        try:
+            token_address = pos["token_address"]
+            chain = pos["chain"]
+            symbol = pos["token_symbol"]
+
+            if chain.upper() == "SOL":
+                ui_balance, decimals = await user_trader.get_token_balance(token_address)
+                tokens_raw = int(ui_balance * (10**decimals)) if decimals > 0 else int(ui_balance * 1e9)
+            else:
+                continue
+
+            if tokens_raw <= 0:
+                exit_data = {
+                    "exit_price": 0, "sell_amount_native": 0,
+                    "profit_usd": None, "roi_percent": -100,
+                    "sell_tx_hash": "zero_balance", "duration_seconds": 0,
+                }
+                await db.close_position(token_address, chain, exit_data, user_id=user_id)
+                sold += 1
+                continue
+
+            result = await user_trader.sell_token(token_address, tokens_raw, decimals)
+            if result:
+                entry_price = pos["entry_price"]
+                roi = ((result["exit_price"] - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                exit_data = {
+                    "exit_price": result["exit_price"],
+                    "sell_amount_native": result["native_received"],
+                    "profit_usd": None,
+                    "roi_percent": roi,
+                    "sell_tx_hash": result["tx_hash"],
+                    "duration_seconds": 0,
+                }
+                await db.close_position(token_address, chain, exit_data, user_id=user_id)
+                total_received += result["native_received"]
+                sold += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            logger.error("Sellall error for %s: %s", pos.get("token_symbol"), exc)
+            failed += 1
+
+    await update.message.reply_html(
+        f"\U0001f534 <b>Panic Sell Complete</b>\n"
+        f"Sold: {sold}/{len(positions)}\n"
+        f"Failed: {failed}\n"
+        f"Total received: {total_received:.6f} {native}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# DCA background loop
+# ---------------------------------------------------------------------------
+
+async def dca_loop():
+    global is_running
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    logger.info("DCA loop started")
+
+    while is_running:
+        try:
+            due_orders = await db.get_active_dca_orders()
+            for order in due_orders:
+                if not is_running:
+                    break
+                try:
+                    uid = order["user_id"]
+                    token_addr = order["token_address"]
+                    amount = order["amount_per_buy"]
+
+                    user_trader = await create_user_trader(uid)
+                    if user_trader is None:
+                        continue
+
+                    balance = await user_trader.get_balance()
+                    if balance < amount + 0.005:
+                        await notifier.send_to_user(uid, f"⚠️ DCA #{order['id']}: insufficient balance ({balance:.4f} {native})")
+                        continue
+
+                    logger.info("DCA buy #%d: %s for user %d (%.4f %s, split %d/%d)",
+                                order["id"], token_addr[:12], uid, amount, native,
+                                order["splits_done"] + 1, order["splits_total"])
+
+                    result = await user_trader.buy_token(token_addr, amount)
+                    if result:
+                        existing = await db.is_token_already_bought(token_addr, CHAIN.upper(), uid)
+                        if not existing:
+                            position = {
+                                "token_address": token_addr,
+                                "token_symbol": order.get("token_symbol", token_addr[:8]),
+                                "chain": CHAIN.upper(),
+                                "entry_price": result["entry_price"],
+                                "tokens_received": result["tokens_received"],
+                                "buy_amount_native": result["amount_spent"],
+                                "buy_tx_hash": result["tx_hash"],
+                                "pair_address": "",
+                                "entry_liquidity": 0,
+                                "user_id": uid,
+                            }
+                            await db.save_open_position(position)
+
+                        await db.advance_dca_order(order["id"])
+
+                        remaining = order["splits_total"] - order["splits_done"] - 1
+                        await notifier.send_to_user(
+                            uid,
+                            f"📊 DCA #{order['id']} buy {order['splits_done']+1}/{order['splits_total']}: "
+                            f"{amount:.4f} {native} → {order.get('token_symbol', token_addr[:8])}\n"
+                            f"{'✅ DCA complete!' if remaining == 0 else f'{remaining} buys remaining'}"
+                        )
+                    else:
+                        await notifier.send_to_user(uid, f"❌ DCA #{order['id']} buy failed. Will retry next interval.")
+
+                except Exception as exc:
+                    logger.error("DCA order #%d error: %s", order.get("id", 0), exc)
+
+        except Exception as exc:
+            logger.error("DCA loop error: %s", exc)
+
+        await asyncio.sleep(30)
+
+
+# ---------------------------------------------------------------------------
+# Limit order background loop
+# ---------------------------------------------------------------------------
+
+async def limit_order_loop():
+    global is_running
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    logger.info("Limit order loop started")
+
+    while is_running:
+        try:
+            orders = await db.get_active_limit_orders()
+            for order in orders:
+                if not is_running:
+                    break
+                try:
+                    token_addr = order["token_address"]
+                    uid = order["user_id"]
+
+                    current_price = await trader.get_token_price_via_jupiter(token_addr)
+                    if current_price <= 0:
+                        continue
+
+                    target = order["target_price"]
+                    triggered = False
+
+                    if order["side"] == "buy" and current_price <= target:
+                        triggered = True
+                    elif order["side"] == "sell" and current_price >= target:
+                        triggered = True
+
+                    if not triggered:
+                        continue
+
+                    user_trader = await create_user_trader(uid)
+                    if user_trader is None:
+                        continue
+
+                    if order["side"] == "buy":
+                        amount = order["amount"]
+                        result = await user_trader.buy_token(token_addr, amount)
+                        if result:
+                            existing = await db.is_token_already_bought(token_addr, CHAIN.upper(), uid)
+                            if not existing:
+                                position = {
+                                    "token_address": token_addr,
+                                    "token_symbol": order.get("token_symbol", token_addr[:8]),
+                                    "chain": CHAIN.upper(),
+                                    "entry_price": result["entry_price"],
+                                    "tokens_received": result["tokens_received"],
+                                    "buy_amount_native": result["amount_spent"],
+                                    "buy_tx_hash": result["tx_hash"],
+                                    "pair_address": "",
+                                    "entry_liquidity": 0,
+                                    "user_id": uid,
+                                }
+                                await db.save_open_position(position)
+
+                            await db.fill_limit_order(order["id"], result["tx_hash"])
+                            await notifier.send_to_user(
+                                uid,
+                                f"📋 Limit BUY filled! #{order['id']}\n"
+                                f"{order.get('token_symbol', token_addr[:8])} @ {current_price:.10f} {native}\n"
+                                f"Spent: {amount:.4f} {native}"
+                            )
+
+                    elif order["side"] == "sell":
+                        sell_pct = order["amount"]
+                        ui_balance, decimals = await user_trader.get_token_balance(token_addr)
+                        if ui_balance <= 0:
+                            continue
+                        sell_ui = ui_balance * (sell_pct / 100)
+                        sell_raw = int(sell_ui * (10 ** decimals)) if decimals > 0 else int(sell_ui * 1e9)
+
+                        if sell_raw <= 0:
+                            continue
+
+                        result = await user_trader.sell_token(token_addr, sell_raw, decimals)
+                        if result:
+                            await db.fill_limit_order(order["id"], result["tx_hash"])
+
+                            if sell_pct == 100:
+                                positions = await db.get_open_positions(user_id=uid)
+                                for pos in positions:
+                                    if pos["token_address"].lower() == token_addr.lower():
+                                        entry_price = pos["entry_price"]
+                                        roi = ((result["exit_price"] - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                                        exit_data = {
+                                            "exit_price": result["exit_price"],
+                                            "sell_amount_native": result["native_received"],
+                                            "profit_usd": None,
+                                            "roi_percent": roi,
+                                            "sell_tx_hash": result["tx_hash"],
+                                            "duration_seconds": 0,
+                                        }
+                                        await db.close_position(token_addr, CHAIN.upper(), exit_data, user_id=uid)
+                                        break
+
+                            await notifier.send_to_user(
+                                uid,
+                                f"📋 Limit SELL filled! #{order['id']}\n"
+                                f"{order.get('token_symbol', token_addr[:8])} @ {current_price:.10f} {native}\n"
+                                f"Received: {result['native_received']:.6f} {native}"
+                            )
+
+                except Exception as exc:
+                    logger.error("Limit order #%d error: %s", order.get("id", 0), exc)
+
+        except Exception as exc:
+            logger.error("Limit order loop error: %s", exc)
+
+        await asyncio.sleep(15)
+
+
+# ---------------------------------------------------------------------------
+# /pnl command
+# ---------------------------------------------------------------------------
+
+async def cmd_pnl(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    days = 1
+    if context.args:
+        try:
+            days = int(context.args[0])
+            days = max(1, min(days, 30))
+        except ValueError:
+            pass
+
+    report = await db.get_pnl_report(user_id, days=days)
+    if report is None:
+        await update.message.reply_text("Could not generate report.")
+        return
+
+    balance = 0.0
+    try:
+        user_trader = await create_user_trader(user_id)
+        if user_trader:
+            balance = await user_trader.get_balance()
+    except Exception:
+        pass
+
+    period = "Today" if days == 1 else f"Last {days} days"
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "📊 <b>PnL REPORT</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"📅 {period}",
+        "",
+    ]
+
+    if report["trades"] > 0:
+        pnl_emoji = "🟢" if report["net_pnl"] >= 0 else "🔴"
+        lines.append("<b>Activity:</b>")
+        lines.append(f"  Trades closed: {report['trades']}")
+        lines.append(f"  Wins/Losses: {report['wins']}/{report['losses']}")
+        lines.append(f"  Win rate: {report['win_rate']:.0f}%")
+        lines.append(f"  {pnl_emoji} Net P&L: {report['net_pnl']:+.6f} {native}")
+        if report["best_trade"]:
+            lines.append(f"  🏆 Best: {report['best_trade']['symbol']} ({report['best_trade']['roi']:+.1f}%)")
+        if report["worst_trade"]:
+            lines.append(f"  💀 Worst: {report['worst_trade']['symbol']} ({report['worst_trade']['roi']:+.1f}%)")
+        lines.append("")
+    else:
+        lines.append("No trades closed in this period.\n")
+
+    lines.append(f"<b>Open Positions:</b> {report['open_count']}")
+    if report["open_count"] > 0:
+        lines.append(f"  Total invested: {report['total_invested']:.4f} {native}")
+
+    lines.append(f"\n💰 Wallet balance: {balance:.6f} {native}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+    await update.message.reply_html("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# /compound command
+# ---------------------------------------------------------------------------
+
+async def cmd_compound(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    user_cfg = await db.get_effective_config(user_id)
+
+    if not context.args:
+        fund = await db.get_compound_fund(user_id)
+        status = "🟢 ON" if user_cfg.get("compound_enabled") else "🔴 OFF"
+        await update.message.reply_html(
+            f"🔄 <b>Auto-Compound</b>\n\n"
+            f"Status: {status}\n"
+            f"Reinvest: {user_cfg.get('compound_percent', 50)}% of profits\n"
+            f"Fund balance: {fund:.6f} {native}\n\n"
+            f"<code>/compound on</code> — enable\n"
+            f"<code>/compound off</code> — disable\n"
+            f"<code>/compound percent 75</code> — set reinvest %\n"
+            f"<code>/compound withdraw</code> — withdraw fund to wallet"
+        )
+        return
+
+    subcmd = context.args[0].lower()
+
+    if subcmd == "on":
+        await db.upsert_user_setting(user_id, "compound_enabled", 1)
+        await update.message.reply_text("🟢 Auto-compound enabled.")
+    elif subcmd == "off":
+        await db.upsert_user_setting(user_id, "compound_enabled", 0)
+        await update.message.reply_text("🔴 Auto-compound disabled.")
+    elif subcmd == "percent" and len(context.args) >= 2:
+        try:
+            pct = int(context.args[1])
+            if 1 <= pct <= 100:
+                await db.upsert_user_setting(user_id, "compound_percent", pct)
+                await update.message.reply_text(f"✅ Compound percent set to {pct}%.")
+            else:
+                await update.message.reply_text("Must be 1-100.")
+        except ValueError:
+            await update.message.reply_text("Invalid number.")
+    elif subcmd == "withdraw":
+        fund = await db.get_compound_fund(user_id)
+        if fund < 0.001:
+            await update.message.reply_text("Compound fund is empty.")
+        else:
+            await db.deduct_compound_funds(user_id, fund)
+            await update.message.reply_html(
+                f"✅ Withdrew {fund:.6f} {native} from compound fund to your wallet balance."
+            )
+    else:
+        await update.message.reply_text("Unknown subcommand. Use on, off, percent, or withdraw.")
+
+
+# ---------------------------------------------------------------------------
+# /dca command
+# ---------------------------------------------------------------------------
+
+async def cmd_dca(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    if not context.args:
+        await update.message.reply_html(
+            "📊 <b>DCA Mode</b>\n\n"
+            "Usage: <code>/dca &lt;token&gt; &lt;total_sol&gt; &lt;splits&gt; &lt;interval_min&gt;</code>\n"
+            "Example: <code>/dca EPjF...1v 0.3 3 5</code>\n"
+            "(Buy 0.3 SOL in 3 orders, 5min apart)\n\n"
+            "<code>/dca list</code> — view active orders\n"
+            "<code>/dca cancel &lt;id&gt;</code> — cancel order"
+        )
+        return
+
+    if context.args[0].lower() == "list":
+        orders = await db.get_user_dca_orders(user_id)
+        if not orders:
+            await update.message.reply_text("No active DCA orders.")
+            return
+        lines = ["📊 <b>Active DCA Orders</b>\n"]
+        for o in orders:
+            lines.append(
+                f"#{o['id']} {o['token_symbol']} — "
+                f"{o['splits_done']}/{o['splits_total']} buys "
+                f"({o['amount_per_buy']:.4f} {native} each, "
+                f"every {o['interval_seconds']//60}min)"
+            )
+        await update.message.reply_html("\n".join(lines))
+        return
+
+    if context.args[0].lower() == "cancel":
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /dca cancel <order_id>")
+            return
+        order_id = int(context.args[1])
+        cancelled = await db.cancel_dca_order(order_id, user_id)
+        await update.message.reply_text("✅ DCA order cancelled." if cancelled else "❌ Order not found or not yours.")
+        return
+
+    if len(context.args) < 4:
+        await update.message.reply_text("Usage: /dca <token> <total_sol> <splits> <interval_min>")
+        return
+
+    token_address = context.args[0]
+    try:
+        total_amount = float(context.args[1])
+        splits = int(context.args[2])
+        interval_min = int(context.args[3])
+    except ValueError:
+        await update.message.reply_text("Invalid numbers. Check your input.")
+        return
+
+    if total_amount <= 0 or splits < 2 or splits > 20 or interval_min < 1 or interval_min > 1440:
+        await update.message.reply_text("Limits: amount > 0, splits 2-20, interval 1-1440 min")
+        return
+
+    amount_per = total_amount / splits
+
+    user_trader = await create_user_trader(user_id)
+    if user_trader is None:
+        await update.message.reply_text("No wallet found.")
+        return
+
+    order_id = await db.create_dca_order(
+        user_id=user_id,
+        token_address=token_address,
+        token_symbol=token_address[:8],
+        chain=CHAIN.upper(),
+        total_amount=total_amount,
+        splits=splits,
+        interval_seconds=interval_min * 60,
+    )
+
+    if order_id:
+        await update.message.reply_html(
+            f"📊 <b>DCA Order Created</b> (#{order_id})\n"
+            f"Token: <code>{token_address}</code>\n"
+            f"Total: {total_amount:.4f} {native}\n"
+            f"Splits: {splits} × {amount_per:.4f} {native}\n"
+            f"Interval: every {interval_min} min\n"
+            f"First buy starts immediately."
+        )
+    else:
+        await update.message.reply_text("❌ Failed to create DCA order.")
+
+
+# ---------------------------------------------------------------------------
+# /limit command
+# ---------------------------------------------------------------------------
+
+async def cmd_limit(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    if not context.args:
+        await update.message.reply_html(
+            "📋 <b>Limit Orders</b>\n\n"
+            "Buy: <code>/limit buy &lt;token&gt; &lt;sol&gt; &lt;price&gt;</code>\n"
+            "Sell: <code>/limit sell &lt;token&gt; &lt;percent&gt; &lt;price&gt;</code>\n"
+            "List: <code>/limit list</code>\n"
+            "Cancel: <code>/limit cancel &lt;id&gt;</code>\n\n"
+            "Price is in SOL per token."
+        )
+        return
+
+    subcmd = context.args[0].lower()
+
+    if subcmd == "list":
+        orders = await db.get_user_limit_orders(user_id)
+        if not orders:
+            await update.message.reply_text("No active limit orders.")
+            return
+        lines = ["📋 <b>Active Limit Orders</b>\n"]
+        for o in orders:
+            side_emoji = "🟢" if o["side"] == "buy" else "🔴"
+            amount_str = f"{o['amount']:.4f} {native}" if o["side"] == "buy" else f"{o['amount']:.0f}%"
+            lines.append(
+                f"{side_emoji} #{o['id']} {o['side'].upper()} {o.get('token_symbol', o['token_address'][:8])} "
+                f"— {amount_str} @ {o['target_price']:.10f} {native}"
+            )
+        await update.message.reply_html("\n".join(lines))
+        return
+
+    if subcmd == "cancel":
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /limit cancel <order_id>")
+            return
+        order_id = int(context.args[1])
+        cancelled = await db.cancel_limit_order(order_id, user_id)
+        await update.message.reply_text("✅ Limit order cancelled." if cancelled else "❌ Order not found or not yours.")
+        return
+
+    if subcmd in ("buy", "sell"):
+        if len(context.args) < 4:
+            await update.message.reply_text(f"Usage: /limit {subcmd} <token> <amount> <price>")
+            return
+
+        token_address = context.args[1]
+        try:
+            amount = float(context.args[2])
+            target_price = float(context.args[3])
+        except ValueError:
+            await update.message.reply_text("Invalid numbers.")
+            return
+
+        if amount <= 0 or target_price <= 0:
+            await update.message.reply_text("Amount and price must be positive.")
+            return
+
+        if subcmd == "sell" and (amount < 1 or amount > 100):
+            await update.message.reply_text("Sell percent must be 1-100.")
+            return
+
+        order_id = await db.create_limit_order(
+            user_id=user_id,
+            token_address=token_address,
+            token_symbol=token_address[:8],
+            chain=CHAIN.upper(),
+            side=subcmd,
+            amount=amount,
+            target_price=target_price,
+        )
+
+        if order_id:
+            side_label = f"Buy {amount:.4f} {native}" if subcmd == "buy" else f"Sell {amount:.0f}%"
+            await update.message.reply_html(
+                f"📋 <b>Limit Order Created</b> (#{order_id})\n"
+                f"Side: {subcmd.upper()}\n"
+                f"Token: <code>{token_address}</code>\n"
+                f"{side_label} @ {target_price:.10f} {native}/token"
+            )
+        else:
+            await update.message.reply_text("❌ Failed to create limit order.")
+        return
+
+    await update.message.reply_text("Unknown subcommand. Use buy, sell, list, or cancel.")
+
+
+# ---------------------------------------------------------------------------
+# /orders command — unified view
+# ---------------------------------------------------------------------------
+
+async def cmd_orders(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+    user_id = update.effective_user.id
+    dca_orders = await db.get_user_dca_orders(user_id)
+    limit_orders = await db.get_user_limit_orders(user_id)
+
+    if not dca_orders and not limit_orders:
+        await update.message.reply_text("No active orders.")
+        return
+
+    lines = ["📋 <b>Your Active Orders</b>\n"]
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    if dca_orders:
+        lines.append("<b>DCA Orders:</b>")
+        for o in dca_orders:
+            lines.append(f"  📊 #{o['id']} {o.get('token_symbol', '?')} — {o['splits_done']}/{o['splits_total']} ({o['amount_per_buy']:.4f} {native}/buy)")
+
+    if limit_orders:
+        lines.append("\n<b>Limit Orders:</b>")
+        for o in limit_orders:
+            side_emoji = "🟢" if o["side"] == "buy" else "🔴"
+            lines.append(f"  {side_emoji} #{o['id']} {o['side'].upper()} {o.get('token_symbol', '?')} @ {o['target_price']:.10f}")
+
+    await update.message.reply_html("\n".join(lines))
+
+
 def main():
     logger.info("Starting DexTool Scanner Bot …")
 
@@ -2854,6 +3788,7 @@ def main():
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("config", cmd_config))
+    app.add_handler(CommandHandler("mysettings", cmd_mysettings))
     app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler("sell", cmd_sell))
     app.add_handler(CommandHandler("info", cmd_info))
@@ -2872,6 +3807,14 @@ def main():
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("lowcaps", cmd_lowcaps))
     app.add_handler(CommandHandler("backtest", cmd_backtest))
+    app.add_handler(CommandHandler("blacklist", cmd_blacklist))
+    app.add_handler(CommandHandler("whitelist", cmd_whitelist))
+    app.add_handler(CommandHandler("sellall", cmd_sellall))
+    app.add_handler(CommandHandler("dca", cmd_dca))
+    app.add_handler(CommandHandler("limit", cmd_limit))
+    app.add_handler(CommandHandler("orders", cmd_orders))
+    app.add_handler(CommandHandler("pnl", cmd_pnl))
+    app.add_handler(CommandHandler("compound", cmd_compound))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     def _handle_signal(signum, frame):

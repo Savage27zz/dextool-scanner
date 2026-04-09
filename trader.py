@@ -20,20 +20,51 @@ from config import (
     RPC_URL_BSC,
     RPC_URL_ETH,
     RPC_URL_SOL,
+    RPC_URLS_SOL,
     SLIPPAGE,
     logger,
 )
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
-_shared_client: AsyncClient | None = None
+_shared_clients: list[AsyncClient] = []
+_current_rpc_index: int = 0
+
+
+def _init_shared_clients():
+    global _shared_clients
+    _shared_clients = [AsyncClient(url, commitment=Confirmed) for url in RPC_URLS_SOL]
 
 
 def _get_shared_client() -> AsyncClient:
-    global _shared_client
-    if _shared_client is None:
-        _shared_client = AsyncClient(RPC_URL_SOL, commitment=Confirmed)
-    return _shared_client
+    global _current_rpc_index
+    if not _shared_clients:
+        _init_shared_clients()
+    return _shared_clients[_current_rpc_index % len(_shared_clients)]
+
+
+def _rotate_rpc():
+    global _current_rpc_index
+    if len(_shared_clients) > 1:
+        old_idx = _current_rpc_index
+        _current_rpc_index = (_current_rpc_index + 1) % len(_shared_clients)
+        logger.warning("RPC failover: rotated from endpoint %d to %d", old_idx, _current_rpc_index)
+
+
+async def _rpc_call_with_failover(coro_factory, max_attempts: int = 0):
+    if not _shared_clients:
+        _init_shared_clients()
+    attempts = max_attempts or len(_shared_clients)
+    last_exc = None
+    for _ in range(attempts):
+        client = _get_shared_client()
+        try:
+            return await coro_factory(client)
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("RPC call failed on %s: %s", client._provider.endpoint_uri, exc)
+            _rotate_rpc()
+    raise last_exc
 
 JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
@@ -191,7 +222,9 @@ class SolanaTrader:
 
     async def get_balance(self) -> float:
         try:
-            resp = await self.client.get_balance(self.keypair.pubkey())
+            resp = await _rpc_call_with_failover(
+                lambda c: c.get_balance(self.keypair.pubkey())
+            )
             return resp.value / 1e9
         except Exception as exc:
             logger.error("get_balance error: %s", exc)
@@ -204,9 +237,11 @@ class SolanaTrader:
             owner = self.keypair.pubkey()
             mint_pubkey = Pubkey.from_string(token_mint)
 
-            resp = await self.client.get_token_accounts_by_owner_json_parsed(
-                owner,
-                TokenAccountOpts(mint=mint_pubkey),
+            resp = await _rpc_call_with_failover(
+                lambda c: c.get_token_accounts_by_owner_json_parsed(
+                    owner,
+                    TokenAccountOpts(mint=mint_pubkey),
+                )
             )
 
             if resp.value:
@@ -234,7 +269,9 @@ class SolanaTrader:
         try:
             from solders.pubkey import Pubkey
             mint_pubkey = Pubkey.from_string(token_mint)
-            resp = await self.client.get_account_info(mint_pubkey)
+            resp = await _rpc_call_with_failover(
+                lambda c: c.get_account_info(mint_pubkey)
+            )
             if resp.value and resp.value.data:
                 data = bytes(resp.value.data)
                 if len(data) >= 45:
@@ -360,9 +397,11 @@ class SolanaTrader:
                 tx = VersionedTransaction.from_bytes(raw_tx)
                 signed_tx = VersionedTransaction(tx.message, [self.keypair])
 
-                send_resp = await self.client.send_raw_transaction(
-                    bytes(signed_tx),
-                    opts=TxOpts(skip_preflight=True, max_retries=3),
+                send_resp = await _rpc_call_with_failover(
+                    lambda c: c.send_raw_transaction(
+                        bytes(signed_tx),
+                        opts=TxOpts(skip_preflight=True, max_retries=3),
+                    )
                 )
 
                 signature = str(send_resp.value)
@@ -452,9 +491,11 @@ class SolanaTrader:
             tx = VersionedTransaction.from_bytes(raw_tx)
             signed_tx = VersionedTransaction(tx.message, [self.keypair])
 
-            send_resp = await self.client.send_raw_transaction(
-                bytes(signed_tx),
-                opts=TxOpts(skip_preflight=True, max_retries=3),
+            send_resp = await _rpc_call_with_failover(
+                lambda c: c.send_raw_transaction(
+                    bytes(signed_tx),
+                    opts=TxOpts(skip_preflight=True, max_retries=3),
+                )
             )
 
             signature = str(send_resp.value)
@@ -487,7 +528,9 @@ class SolanaTrader:
         sig = Signature.from_string(signature)
         start = time.time()
         while time.time() - start < timeout:
-            resp = await self.client.get_signature_statuses([sig])
+            resp = await _rpc_call_with_failover(
+                lambda c: c.get_signature_statuses([sig])
+            )
             statuses = resp.value
             if statuses and statuses[0] is not None:
                 if statuses[0].err is None:

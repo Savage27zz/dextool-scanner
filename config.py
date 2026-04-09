@@ -29,6 +29,7 @@ PRIVATE_KEY: str = _env("PRIVATE_KEY", required=True)
 ENCRYPTION_KEY: str = _env("ENCRYPTION_KEY", required=True)
 
 RPC_URL_SOL: str = _env("RPC_URL_SOL", default="https://api.mainnet-beta.solana.com")
+RPC_URLS_SOL: list[str] = [u.strip() for u in RPC_URL_SOL.split(",") if u.strip()]
 RPC_URL_ETH: str = _env("RPC_URL_ETH", default="")
 RPC_URL_BSC: str = _env("RPC_URL_BSC", default="")
 
@@ -70,6 +71,9 @@ MAX_OPEN_POSITIONS: int = _env("MAX_OPEN_POSITIONS", default="3", cast=int)
 MAX_DAILY_LOSS: float = _env("MAX_DAILY_LOSS", default="2.0", cast=float)  # in native token (SOL/ETH/BNB)
 MAX_BUY_AMOUNT: float = _env("MAX_BUY_AMOUNT", default="1.0", cast=float)  # max per single buy in native token
 
+COMPOUND_ENABLED: bool = _env("COMPOUND_ENABLED", default="false", cast=lambda v: v.lower() in ("true", "1", "yes"))
+COMPOUND_PERCENT: int = _env("COMPOUND_PERCENT", default="50", cast=int)
+
 API_ENABLED: bool = _env("API_ENABLED", default="false", cast=lambda v: v.lower() in ("true", "1", "yes"))
 API_PORT: int = _env("API_PORT", default="8080", cast=int)
 API_KEY: str = _env("API_KEY", default="")
@@ -79,6 +83,16 @@ ALERT_BROADCAST: bool = _env("ALERT_BROADCAST", default="false", cast=lambda v: 
 SNIPER_ENABLED: bool = _env("SNIPER_ENABLED", default="false", cast=lambda v: v.lower() in ("true", "1", "yes"))
 SNIPER_CHECK_INTERVAL: int = _env("SNIPER_CHECK_INTERVAL", default="10", cast=int)
 SNIPER_MIN_LIQUIDITY: int = _env("SNIPER_MIN_LIQUIDITY", default="1000", cast=int)
+
+# Pump.fun scanner
+HELIUS_API_KEY: str = _env("HELIUS_API_KEY", default="")
+HELIUS_RPC_URL: str = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
+PUMPFUN_ENABLED: bool = _env("PUMPFUN_ENABLED", default="true", cast=lambda v: v.lower() in ("true", "1", "yes"))
+PUMPFUN_SCAN_INTERVAL: int = _env("PUMPFUN_SCAN_INTERVAL", default="30", cast=int)
+PUMPFUN_MIN_BONDING_PCT: int = _env("PUMPFUN_MIN_BONDING_PCT", default="75", cast=int)  # pre-migration threshold
+PUMPFUN_MAX_AGE_HOURS: float = _env("PUMPFUN_MAX_AGE_HOURS", default="2.0", cast=float)  # post-migration max age
+PUMPFUN_MIN_DEV_SCORE: int = _env("PUMPFUN_MIN_DEV_SCORE", default="40", cast=int)
+PUMPFUN_DIP_BUY_PCT: int = _env("PUMPFUN_DIP_BUY_PCT", default="20", cast=int)  # buy at this % dip from initial
 
 SELL_TIERS_RAW: str = _env("SELL_TIERS", default="")
 

@@ -159,6 +159,21 @@ CREATE TABLE IF NOT EXISTS snipe_targets (
 );
 """
 
+_CREATE_USER_SETTINGS = """
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id INTEGER PRIMARY KEY,
+    min_score INTEGER,
+    stop_loss INTEGER,
+    take_profit INTEGER,
+    buy_percent INTEGER,
+    trailing_drop INTEGER,
+    slippage INTEGER,
+    max_positions INTEGER,
+    max_buy_amount REAL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 _CREATE_FEE_LEDGER = """
 CREATE TABLE IF NOT EXISTS fee_ledger (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,6 +185,76 @@ CREATE TABLE IF NOT EXISTS fee_ledger (
     fee_tx_hash TEXT,
     status TEXT DEFAULT 'pending',   -- 'pending', 'submitted', 'collected', 'failed'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+_CREATE_TOKEN_BLACKLIST = """
+CREATE TABLE IF NOT EXISTS token_blacklist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_address TEXT NOT NULL,
+    chain TEXT NOT NULL DEFAULT 'SOL',
+    reason TEXT DEFAULT '',
+    added_by INTEGER NOT NULL,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(token_address, chain)
+);
+"""
+
+_CREATE_TOKEN_WHITELIST = """
+CREATE TABLE IF NOT EXISTS token_whitelist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_address TEXT NOT NULL,
+    chain TEXT NOT NULL DEFAULT 'SOL',
+    label TEXT DEFAULT '',
+    added_by INTEGER NOT NULL,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(token_address, chain)
+);
+"""
+
+_CREATE_DCA_ORDERS = """
+CREATE TABLE IF NOT EXISTS dca_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_address TEXT NOT NULL,
+    token_symbol TEXT DEFAULT '',
+    chain TEXT NOT NULL DEFAULT 'SOL',
+    total_amount REAL NOT NULL,
+    amount_per_buy REAL NOT NULL,
+    splits_total INTEGER NOT NULL,
+    splits_done INTEGER DEFAULT 0,
+    interval_seconds INTEGER NOT NULL,
+    status TEXT DEFAULT 'active',
+    last_buy_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+_CREATE_LIMIT_ORDERS = """
+CREATE TABLE IF NOT EXISTS limit_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_address TEXT NOT NULL,
+    token_symbol TEXT DEFAULT '',
+    chain TEXT NOT NULL DEFAULT 'SOL',
+    side TEXT NOT NULL,
+    amount REAL NOT NULL,
+    target_price REAL NOT NULL,
+    condition TEXT NOT NULL DEFAULT 'lte',
+    status TEXT DEFAULT 'active',
+    fill_tx_hash TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    filled_at TIMESTAMP
+);
+"""
+
+_CREATE_COMPOUND_FUND = """
+CREATE TABLE IF NOT EXISTS compound_fund (
+    user_id INTEGER PRIMARY KEY,
+    available REAL DEFAULT 0.0,
+    total_compounded REAL DEFAULT 0.0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
 
@@ -196,6 +281,16 @@ async def init_db():
         await db.execute(_CREATE_FEE_LEDGER)
         await db.execute(_CREATE_SCAN_HISTORY)
         await db.execute(_CREATE_SNIPE_TARGETS)
+        await db.execute(_CREATE_USER_SETTINGS)
+        await db.execute(_CREATE_TOKEN_BLACKLIST)
+        await db.execute(_CREATE_TOKEN_WHITELIST)
+        await db.execute(_CREATE_DCA_ORDERS)
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_dca_active_unique "
+            "ON dca_orders(user_id, token_address, chain) WHERE status = 'active'"
+        )
+        await db.execute(_CREATE_LIMIT_ORDERS)
+        await db.execute(_CREATE_COMPOUND_FUND)
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
         except Exception:
@@ -254,6 +349,14 @@ async def init_db():
                     logger.info("Migrated open_positions table with user_id constraint")
         except Exception as exc:
             logger.warning("open_positions migration check: %s", exc)
+        try:
+            await db.execute("ALTER TABLE user_settings ADD COLUMN compound_enabled INTEGER")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE user_settings ADD COLUMN compound_percent INTEGER")
+        except Exception:
+            pass
         await db.commit()
     logger.info("Database initialised at %s", DB_PATH)
 
@@ -1114,3 +1217,452 @@ async def mark_snipe_filled(token_address: str, user_id: int, tx_hash: str):
             (tx_hash, token_address, user_id),
         )
         await db.commit()
+
+
+_USER_SETTINGS_COLUMNS = frozenset({
+    "min_score", "stop_loss", "take_profit", "buy_percent",
+    "trailing_drop", "slippage", "max_positions", "max_buy_amount",
+    "compound_enabled", "compound_percent",
+})
+
+
+async def get_user_settings(user_id: int) -> dict | None:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM user_settings WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+async def upsert_user_setting(user_id: int, key: str, value) -> bool:
+    if key not in _USER_SETTINGS_COLUMNS:
+        return False
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute(
+            f"INSERT INTO user_settings (user_id, {key}, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+            f"ON CONFLICT(user_id) DO UPDATE SET {key} = excluded.{key}, updated_at = CURRENT_TIMESTAMP",
+            (user_id, value),
+        )
+        await conn.commit()
+    return True
+
+
+async def delete_user_settings(user_id: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "DELETE FROM user_settings WHERE user_id = ?", (user_id,)
+        )
+        await conn.commit()
+    return cursor.rowcount > 0
+
+
+async def add_to_blacklist(token_address: str, chain: str, reason: str, added_by: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO token_blacklist (token_address, chain, reason, added_by) VALUES (?, ?, ?, ?)",
+                (token_address, chain, reason, added_by),
+            )
+            await conn.commit()
+            return True
+        except Exception:
+            return False
+
+
+async def remove_from_blacklist(token_address: str, chain: str) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "DELETE FROM token_blacklist WHERE token_address = ? AND chain = ?",
+            (token_address, chain),
+        )
+        await conn.commit()
+    return cursor.rowcount > 0
+
+
+async def is_blacklisted(token_address: str, chain: str) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "SELECT 1 FROM token_blacklist WHERE token_address = ? AND chain = ?",
+            (token_address, chain),
+        )
+        row = await cursor.fetchone()
+    return row is not None
+
+
+async def get_blacklist() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM token_blacklist ORDER BY added_at DESC")
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def add_to_whitelist(token_address: str, chain: str, label: str, added_by: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO token_whitelist (token_address, chain, label, added_by) VALUES (?, ?, ?, ?)",
+                (token_address, chain, label, added_by),
+            )
+            await conn.commit()
+            return True
+        except Exception:
+            return False
+
+
+async def remove_from_whitelist(token_address: str, chain: str) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "DELETE FROM token_whitelist WHERE token_address = ? AND chain = ?",
+            (token_address, chain),
+        )
+        await conn.commit()
+    return cursor.rowcount > 0
+
+
+async def is_whitelisted(token_address: str, chain: str) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "SELECT 1 FROM token_whitelist WHERE token_address = ? AND chain = ?",
+            (token_address, chain),
+        )
+        row = await cursor.fetchone()
+    return row is not None
+
+
+async def get_whitelist() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM token_whitelist ORDER BY added_at DESC")
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# DCA orders
+# ---------------------------------------------------------------------------
+
+async def create_dca_order(user_id: int, token_address: str, token_symbol: str, chain: str,
+                           total_amount: float, splits: int, interval_seconds: int) -> int | None:
+    amount_per = total_amount / splits
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        try:
+            cursor = await conn.execute(
+                "INSERT INTO dca_orders (user_id, token_address, token_symbol, chain, "
+                "total_amount, amount_per_buy, splits_total, interval_seconds) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, token_address, token_symbol, chain, total_amount, amount_per, splits, interval_seconds),
+            )
+            await conn.commit()
+            return cursor.lastrowid
+        except Exception as exc:
+            logger.error("create_dca_order error: %s", exc)
+            return None
+
+
+async def get_active_dca_orders() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM dca_orders WHERE status = 'active' AND splits_done < splits_total "
+            "AND (last_buy_at IS NULL OR last_buy_at <= datetime('now', '-' || interval_seconds || ' seconds'))"
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_user_dca_orders(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM dca_orders WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC",
+            (user_id,),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def advance_dca_order(order_id: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute(
+            "UPDATE dca_orders SET splits_done = splits_done + 1, last_buy_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (order_id,),
+        )
+        cursor = await conn.execute(
+            "SELECT splits_done, splits_total FROM dca_orders WHERE id = ?", (order_id,)
+        )
+        row = await cursor.fetchone()
+        if row and row[0] >= row[1]:
+            await conn.execute("UPDATE dca_orders SET status = 'completed' WHERE id = ?", (order_id,))
+        await conn.commit()
+    return True
+
+
+async def cancel_dca_order(order_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "UPDATE dca_orders SET status = 'cancelled' WHERE id = ? AND user_id = ? AND status = 'active'",
+            (order_id, user_id),
+        )
+        await conn.commit()
+    return cursor.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Limit orders
+# ---------------------------------------------------------------------------
+
+async def create_limit_order(user_id: int, token_address: str, token_symbol: str, chain: str,
+                             side: str, amount: float, target_price: float) -> int | None:
+    condition = "lte" if side == "buy" else "gte"
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        try:
+            cursor = await conn.execute(
+                "INSERT INTO limit_orders (user_id, token_address, token_symbol, chain, "
+                "side, amount, target_price, condition) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, token_address, token_symbol, chain, side, amount, target_price, condition),
+            )
+            await conn.commit()
+            return cursor.lastrowid
+        except Exception as exc:
+            logger.error("create_limit_order error: %s", exc)
+            return None
+
+
+async def get_active_limit_orders() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM limit_orders WHERE status = 'active'"
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_user_limit_orders(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM limit_orders WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC",
+            (user_id,),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def fill_limit_order(order_id: int, tx_hash: str):
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute(
+            "UPDATE limit_orders SET status = 'filled', fill_tx_hash = ?, filled_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (tx_hash, order_id),
+        )
+        await conn.commit()
+
+
+async def cancel_limit_order(order_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "UPDATE limit_orders SET status = 'cancelled' WHERE id = ? AND user_id = ? AND status = 'active'",
+            (order_id, user_id),
+        )
+        await conn.commit()
+    return cursor.rowcount > 0
+
+
+async def get_effective_config(user_id: int) -> dict:
+    from config import (
+        MIN_SCORE, STOP_LOSS, TAKE_PROFIT, BUY_PERCENT,
+        TRAILING_DROP, SLIPPAGE, MAX_OPEN_POSITIONS, MAX_BUY_AMOUNT,
+        COMPOUND_ENABLED, COMPOUND_PERCENT,
+    )
+    defaults = {
+        "min_score": MIN_SCORE,
+        "stop_loss": STOP_LOSS,
+        "take_profit": TAKE_PROFIT,
+        "buy_percent": BUY_PERCENT,
+        "trailing_drop": TRAILING_DROP,
+        "slippage": SLIPPAGE,
+        "max_positions": MAX_OPEN_POSITIONS,
+        "max_buy_amount": MAX_BUY_AMOUNT,
+        "compound_enabled": COMPOUND_ENABLED,
+        "compound_percent": COMPOUND_PERCENT,
+    }
+    user = await get_user_settings(user_id)
+    if user:
+        for key in defaults:
+            val = user.get(key)
+            if val is not None:
+                defaults[key] = val
+    return defaults
+
+
+# ---------------------------------------------------------------------------
+# Compound fund helpers
+# ---------------------------------------------------------------------------
+
+async def add_compound_funds(user_id: int, amount: float):
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute(
+            "INSERT INTO compound_fund (user_id, available, total_compounded, updated_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "available = available + excluded.available, "
+            "total_compounded = total_compounded + excluded.total_compounded, "
+            "updated_at = CURRENT_TIMESTAMP",
+            (user_id, amount, amount),
+        )
+        await conn.commit()
+
+
+async def get_compound_fund(user_id: int) -> float:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "SELECT available FROM compound_fund WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+    return float(row[0]) if row else 0.0
+
+
+async def deduct_compound_funds(user_id: int, amount: float):
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute(
+            "UPDATE compound_fund SET available = MAX(available - ?, 0), "
+            "updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+            (amount, user_id),
+        )
+        await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# PnL report helpers
+# ---------------------------------------------------------------------------
+
+async def get_daily_pnl_report(user_id: int) -> dict | None:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+
+        cursor = await conn.execute("""
+            SELECT
+                COUNT(*) as trades_today,
+                COALESCE(SUM(CASE WHEN roi_percent > 0 THEN 1 ELSE 0 END), 0) as wins,
+                COALESCE(SUM(CASE WHEN roi_percent <= 0 THEN 1 ELSE 0 END), 0) as losses,
+                COALESCE(SUM(sell_amount_native - buy_amount_native), 0) as net_pnl
+            FROM completed_trades
+            WHERE user_id = ? AND closed_at >= date('now')
+        """, (user_id,))
+        row = dict(await cursor.fetchone())
+
+        trades_today = row["trades_today"]
+        wins = row["wins"]
+        losses = row["losses"]
+        net_pnl = row["net_pnl"]
+        win_rate = (wins / trades_today * 100) if trades_today > 0 else 0
+
+        best_trade = None
+        worst_trade = None
+        if trades_today > 0:
+            cursor = await conn.execute("""
+                SELECT token_symbol as symbol, roi_percent as roi
+                FROM completed_trades
+                WHERE user_id = ? AND closed_at >= date('now')
+                ORDER BY roi_percent DESC LIMIT 1
+            """, (user_id,))
+            best_row = await cursor.fetchone()
+            if best_row:
+                best_trade = dict(best_row)
+
+            cursor = await conn.execute("""
+                SELECT token_symbol as symbol, roi_percent as roi
+                FROM completed_trades
+                WHERE user_id = ? AND closed_at >= date('now')
+                ORDER BY roi_percent ASC LIMIT 1
+            """, (user_id,))
+            worst_row = await cursor.fetchone()
+            if worst_row:
+                worst_trade = dict(worst_row)
+
+        cursor = await conn.execute("""
+            SELECT COUNT(*) as cnt, COALESCE(SUM(buy_amount_native), 0) as total_invested
+            FROM open_positions WHERE user_id = ?
+        """, (user_id,))
+        pos_row = dict(await cursor.fetchone())
+
+    return {
+        "trades_today": trades_today,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "net_pnl": net_pnl,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "open_count": pos_row["cnt"],
+        "total_invested": pos_row["total_invested"],
+    }
+
+
+async def get_pnl_report(user_id: int, days: int = 1) -> dict | None:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        date_filter = f"-{days} days"
+
+        cursor = await conn.execute("""
+            SELECT
+                COUNT(*) as trades,
+                COALESCE(SUM(CASE WHEN roi_percent > 0 THEN 1 ELSE 0 END), 0) as wins,
+                COALESCE(SUM(CASE WHEN roi_percent <= 0 THEN 1 ELSE 0 END), 0) as losses,
+                COALESCE(SUM(sell_amount_native - buy_amount_native), 0) as net_pnl
+            FROM completed_trades
+            WHERE user_id = ? AND closed_at >= datetime('now', ?)
+        """, (user_id, date_filter))
+        row = dict(await cursor.fetchone())
+
+        trades = row["trades"]
+        wins = row["wins"]
+        losses = row["losses"]
+        net_pnl = row["net_pnl"]
+        win_rate = (wins / trades * 100) if trades > 0 else 0
+
+        best_trade = None
+        worst_trade = None
+        if trades > 0:
+            cursor = await conn.execute("""
+                SELECT token_symbol as symbol, roi_percent as roi
+                FROM completed_trades
+                WHERE user_id = ? AND closed_at >= datetime('now', ?)
+                ORDER BY roi_percent DESC LIMIT 1
+            """, (user_id, date_filter))
+            best_row = await cursor.fetchone()
+            if best_row:
+                best_trade = dict(best_row)
+
+            cursor = await conn.execute("""
+                SELECT token_symbol as symbol, roi_percent as roi
+                FROM completed_trades
+                WHERE user_id = ? AND closed_at >= datetime('now', ?)
+                ORDER BY roi_percent ASC LIMIT 1
+            """, (user_id, date_filter))
+            worst_row = await cursor.fetchone()
+            if worst_row:
+                worst_trade = dict(worst_row)
+
+        cursor = await conn.execute("""
+            SELECT COUNT(*) as cnt, COALESCE(SUM(buy_amount_native), 0) as total_invested
+            FROM open_positions WHERE user_id = ?
+        """, (user_id,))
+        pos_row = dict(await cursor.fetchone())
+
+    return {
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "net_pnl": net_pnl,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "open_count": pos_row["cnt"],
+        "total_invested": pos_row["total_invested"],
+    }
